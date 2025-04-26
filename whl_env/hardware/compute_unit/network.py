@@ -16,262 +16,493 @@
 
 
 import logging
-from typing import Dict, List, Any, Tuple, Optional
-from whl_env.utils import run_command
+import json
+import time
+from typing import Dict, List, Any, Optional
 
-def get_network_info() -> Dict[str, Any]:
+try:
+    import psutil
+except ImportError:
+    print("Error: The 'psutil' library is required. Please install it using 'pip install psutil'")
+    exit(1)
+
+# --- Placeholder for CAN bus specific library ---
+# This would be an actual library like 'python-can'
+try:
+    # from can import interface # Example import from python-can
+    CAN_LIB_AVAILABLE = False # Set to True if actual lib is imported
+except ImportError:
+    CAN_LIB_AVAILABLE = False
+    logging.warning("Python-can library not found. CAN bus monitoring will be limited or unavailable.")
+
+# --- Placeholder for Serial (RS232) specific library ---
+# This would be an actual library like 'pyserial'
+try:
+    # import serial # Example import from pyserial
+    SERIAL_LIB_AVAILABLE = False # Set to True if actual lib is imported
+except ImportError:
+    SERIAL_LIB_AVAILABLE = False
+    logging.warning("PySerial library not found. RS232 monitoring will be limited or unavailable.")
+
+
+# Configure basic logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+class NetworkManager:
     """
-    Retrieves basic network interface information (name, MAC address, IP addresses, state).
-    Uses the 'ip address show' command on Linux systems.
-
-    Returns:
-        A dictionary containing network interface list and potentially errors.
-        Example structure:
-        {
-            'interfaces': [
-                {
-                    'name': 'lo',
-                    'state': 'UNKNOWN',
-                    'flags': ['LOOPBACK', 'UP', 'LOWER_UP'],
-                    'link_type': 'loopback',
-                    'mac_address': '00:00:00:00:00:00',
-                    'addresses': [
-                        {'family': 'inet', 'address': '127.0.0.1', 'cidr': '127.0.0.1/8'},
-                        {'family': 'inet6', 'address': '::1', 'cidr': '::1/128'}
-                    ]
-                },
-                {
-                    'name': 'eth0',
-                    'state': 'UP',
-                    'flags': ['BROADCAST', 'MULTICAST', 'UP', 'LOWER_UP'],
-                    'link_type': 'ether',
-                    'mac_address': '00:1a:7f:xx:xx:xx',
-                    'addresses': [
-                        {'family': 'inet', 'address': '192.168.1.100', 'cidr': '192.168.1.100/24'},
-                        {'family': 'inet6', 'address': 'fe80::xxxx:xxxx:xxxx:xxxx', 'cidr': 'fe80::xxxx:xxxx:xxxx:xxxx/64'}
-                    ]
-                },
-                ...
-            ],
-            'errors': ['List of any errors encountered']
-        }
+    Manages retrieval of network interface information, including configuration
+    and real-time statistics (flow rate, packet counts, errors, drops).
+    Primarily uses psutil for robust and cross-platform data collection.
     """
-    network_info: Dict[str, Any] = {}
-    interface_list: List[InterfaceInfo] = []
-    errors: List[str] = []
+    def __init__(self):
+        # We store last counters globally for the class instance to enable rate calculation
+        self._last_net_io_counters: Dict[str, psutil._common.snetio] = {}
+        # Store the timestamp of the last counter read
+        self._last_net_io_timestamp: float = time.monotonic()
+        logging.info("NetworkManager initialized.")
 
-    # Use 'ip address show' command on Linux (preferred over ifconfig)
-    # This command lists interfaces and their addresses
-    ip_command = ['ip', 'address', 'show']
-    logging.info(f"Running command: {' '.join(ip_command)}")
-    output = run_command(ip_command, timeout=10)
+    def get_interface_config(self) -> Dict[str, Any]:
+        """
+        Retrieves static configuration details for all network interfaces (primarily IP-based).
 
-    if output:
-        # Parse the output of 'ip address show'
-        # The output format is block-based, starting with a number and colon (e.g., "1: lo: ...")
-        # Subsequent lines for the same interface are indented.
+        Returns:
+            A dictionary containing a list of interface configurations.
+        """
+        interfaces_config: List[Dict[str, Any]] = []
+        try:
+            addrs = psutil.net_if_addrs()
+            stats = psutil.net_if_stats()
 
-        interfaces_raw_lines = output.strip().split('\n')
-        # Use Optional for clarity
-        current_iface: Optional[InterfaceInfo] = None
-        addresses: List[AddressInfo] = []
+            for name, addr_list in addrs.items():
+                iface_info: Dict[str, Any] = {
+                    "name": name,
+                    "addresses": [],
+                    "mac_address": "N/A",
+                    "state": "UNKNOWN",
+                    "is_up": False,
+                    "duplex": "N/A",
+                    "speed_mbps": "N/A"
+                }
 
-        for line in interfaces_raw_lines:
-            line = line.strip()
+                if name in stats:
+                    stat = stats[name]
+                    iface_info["is_up"] = stat.isup
+                    iface_info["state"] = "UP" if stat.isup else "DOWN"
+                    iface_info["duplex"] = str(stat.duplex).split('.')[-1]
+                    iface_info["speed_mbps"] = stat.speed
 
-            # Check if the line starts a new interface block
-            # A new block starts with a number followed by a colon, possibly space, then interface name
-            # Using a simple check for digit followed by colon at the start
-            if line and line[0].isdigit() and ':' in line.split(' ', 1)[0]:
-                # If we were processing a previous interface, save it
-                if current_iface is not None:
-                    current_iface['addresses'] = addresses
-                    interface_list.append(current_iface)
-                    addresses = []  # Reset addresses for the new interface
-
-                # Start parsing the new interface block
-                current_iface = {}
-                # Split only by the first two colons
-                parts = line.split(':', 2)
-
-                if len(parts) > 1:
-                    # Parse interface name, flags, state from the first line
-                    name_flags_state_part = parts[1].strip()
-                    # Extract name (before '<' or the rest of the string)
-                    name_match = name_flags_state_part.split('<', 1)
-                    current_iface['name'] = name_match[0].strip()
-
-                    # Extract flags (inside '<...>')
-                    if len(name_match) > 1:
-                        # Part starting from '<FLAGS> ...'
-                        flags_state_part = name_match[1]
-                        flags_match = flags_state_part.split('>', 1)
-                        if len(flags_match) > 0:
-                            current_iface['flags'] = [f.strip() for f in flags_match[0].split(
-                                ',') if f.strip()]  # Handle empty strings
-                            # Extract state (after 'state ' in the remaining part)
-                            if len(flags_match) > 1:
-                                state_part = flags_match[1]
-                                state_match = state_part.split('state', 1)
-                                if len(state_match) > 1:
-                                    current_iface['state'] = state_match[1].split(' ')[
-                                        0].strip()
-                                else:
-                                    # Default if 'state' keyword not found
-                                    current_iface['state'] = 'Unknown'
-                            else:
-                                # Default if '>' not found after flags
-                                current_iface['state'] = 'Unknown'
-                        else:
-                            current_iface['flags'] = []  # No flags found
-                            # Default if '<...>' structure is malformed
-                            current_iface['state'] = 'Unknown'
+                for addr in addr_list:
+                    if addr.family == psutil.AF_LINK:
+                        iface_info["mac_address"] = addr.address
                     else:
-                        current_iface['flags'] = []  # No '<' found
-                        # Try to find state even without flags
-                        state_match = name_flags_state_part.split('state', 1)
-                        if len(state_match) > 1:
-                            current_iface['state'] = state_match[1].split(' ')[
-                                0].strip()
-                        else:
-                            # Default if no '<' and no 'state' keyword
-                            current_iface['state'] = 'Unknown'
+                        family_name = "IPv4" if addr.family == psutil.AF_INET else \
+                                      "IPv6" if addr.family == psutil.AF_INET6 else \
+                                      str(addr.family)
 
-            # Check for link layer address (MAC address, etc.) - usually starts with "link/" and is indented
-            # Check for indentation and starts with "link/"
-            elif line.startswith('link/'):
-                if current_iface is not None:
-                    link_parts = line.split(' ', 2)
-                    if len(link_parts) > 1:
-                        current_iface['link_type'] = link_parts[0].split(
-                            '/')[1].strip()
-                        current_iface['mac_address'] = link_parts[1].strip()
-                else:
-                    logging.warning(
-                        f"Found link line before interface block: {line}")
+                        # Calculate CIDR for IPv4 if netmask is available
+                        cidr = None
+                        if addr.netmask and addr.family == psutil.AF_INET:
+                            try:
+                                # Convert netmask to binary and count '1's
+                                netmask_parts = [int(x) for x in addr.netmask.split('.')]
+                                cidr = sum(bin(x).count('1') for x in netmask_parts)
+                                cidr = f"{addr.address}/{cidr}"
+                            except ValueError:
+                                pass # Malformed netmask
+                        elif addr.family == psutil.AF_INET6 and addr.netmask:
+                             # For IPv6, netmask is already in CIDR format or can be easily converted
+                            cidr = f"{addr.address}/{addr.netmask.count('f')*4}" # Heuristic, not robust
+                            # More robust IPv6 CIDR parsing needs ipaddress module or similar
 
-            # Check for network layer address (IP addresses) - starts with "inet " or "inet6 " and is indented
-            # Check for indentation and starts with "inet " or "inet6 "
-            elif line.startswith('inet ') or line.startswith('inet6 '):
-                if current_iface is not None:
-                    addr_parts = line.split()
-                    if len(addr_parts) > 1:
-                        addr_info: AddressInfo = {'family': addr_parts[0]}
-                        # Address and CIDR are typically the second part (e.g., 192.168.1.100/24)
-                        addr_info['cidr'] = addr_parts[1]
-                        addr_info['address'] = addr_parts[1].split(
-                            '/')[0].strip()  # Address part only
-                        # Other details like scope, valid_lft could be parsed if needed
-                        addresses.append(addr_info)
-                else:
-                    logging.warning(
-                        f"Found address line before interface block: {line}")
+                        iface_info["addresses"].append({
+                            "family": family_name,
+                            "address": addr.address,
+                            "netmask": addr.netmask,
+                            "broadcast": addr.broadcast,
+                            "cidr": cidr
+                        })
+                interfaces_config.append(iface_info)
 
-            # Handle other potential lines for an interface (e.g., broadcast, scope, valid_lft)
-            # You could add more elif clauses here to parse additional details if required.
-            # For this scope, we focus on name, state, mac, and ip addresses.
-            # else:
-            #    logging.debug(f"Skipping line during parsing: {line}")
+            return {"interfaces": interfaces_config}
 
-        # After the loop, add the last interface if one was being processed
-        if current_iface is not None:
-            current_iface['addresses'] = addresses
-            interface_list.append(current_iface)
+        except Exception as e:
+            logging.error(f"Failed to get network interface configuration: {e}")
+            return {"error": f"Failed to get network configuration: {e}"}
 
-        network_info['interfaces'] = interface_list
+    def get_interface_stats(self) -> Dict[str, Any]:
+        """
+        Retrieves real-time network interface statistics (bytes/packets sent/received, errors, drops).
+        Calculates rates (bytes/sec, packets/sec) using the time difference from the last call.
 
-    elif output is None:
-        # Handle command execution errors
-        error_message = f"Error executing '{' '.join(ip_command)}': {output}"
-        errors.append(error_message)
-        logging.error(error_message)
+        Returns:
+            A dictionary containing a list of interface statistics.
+        """
+        current_net_io_counters = psutil.net_io_counters(pernic=True)
+        current_timestamp = time.monotonic()
+        interfaces_stats: List[Dict[str, Any]] = []
 
-        # Check if the error is "command not found"
-        if "command not found" in output.lower():
-            errors.append(
-                f"'{ip_command[0]}' command not found. Cannot reliably get network info on this system."
-                " Attempting 'ifconfig' as a fallback (may provide less detail)."
-            )
-            logging.warning(errors[-1])
+        # Calculate time interval since last call
+        time_delta = current_timestamp - self._last_net_io_timestamp
 
-            # Fallback attempt with ifconfig (deprecated, less info, parsing is different)
-            # For simplicity in this fallback, we just capture raw output.
-            # Full ifconfig parsing would require a different parsing logic.
-            ifconfig_command = ['ifconfig']
-            logging.info(
-                f"Running fallback command: {' '.join(ifconfig_command)}")
-            success_ifconfig, output_ifconfig = run_command(
-                ifconfig_command, timeout=10)
+        if time_delta == 0:
+            # This can happen if called too quickly in succession, or if time.monotonic() resolution is low.
+            # In this case, we cannot calculate rates, so return 0 for rates.
+            logging.warning("Time delta is zero. Cannot calculate rates for network stats.")
 
-            if success_ifconfig and output_ifconfig:
-                # Store raw output from ifconfig for inspection
-                network_info['ifconfig_fallback_raw_output'] = output_ifconfig
-                errors.append(
-                    "Used ifconfig fallback. Parsing not implemented for ifconfig; raw output available.")
-                logging.warning(errors[-1])
-            elif not success_ifconfig:
-                errors.append(
-                    f"Fallback command '{' '.join(ifconfig_command)}' also failed: {output_ifconfig}")
-                logging.error(errors[-1])
-            # else: ifconfig succeeded but had no output? Unlikely, but handled by initial success check.
+        for name, current_stats in current_net_io_counters.items():
+            stats_entry: Dict[str, Any] = {
+                "name": name,
+                "bytes_sent_total": current_stats.bytes_sent,
+                "bytes_recv_total": current_stats.bytes_recv,
+                "packets_sent_total": current_stats.packets_sent,
+                "packets_recv_total": current_stats.packets_recv,
+                "errors_in_total": current_stats.errin,
+                "errors_out_total": current_stats.errout,
+                "drops_in_total": current_stats.dropin,
+                "drops_out_total": current_stats.dropout,
+                "bytes_sent_rate_bps": 0.0,
+                "bytes_recv_rate_bps": 0.0,
+                "packets_sent_rate_pps": 0.0,
+                "packets_recv_rate_pps": 0.0,
+                "errors_in_rate_pps": 0.0,
+                "errors_out_rate_pps": 0.0,
+                "drops_in_rate_pps": 0.0,
+                "drops_out_rate_pps": 0.0,
+                "health_status": "N/A (first sample or no time delta)"
+            }
 
-    else:  # success is True but output is empty - unusual but possible
-        info_msg = f"Command '{' '.join(ip_command)}' returned no output. No network interfaces found or unexpected command behavior."
-        network_info['info'] = info_msg
-        logging.warning(info_msg)
+            if name in self._last_net_io_counters and time_delta > 0:
+                last_stats = self._last_net_io_counters[name]
 
-    if errors:
-        network_info['errors'] = errors
+                bytes_sent_delta = current_stats.bytes_sent - last_stats.bytes_sent
+                bytes_recv_delta = current_stats.bytes_recv - last_stats.bytes_recv
+                packets_sent_delta = current_stats.packets_sent - last_stats.packets_sent
+                packets_recv_delta = current_stats.packets_recv - last_stats.packets_recv
 
-    # Note on bandwidth and latency: This function only retrieves configuration.
-    # Checking bandwidth and latency requires active measurement (e.g., ping, traceroute, iperf)
-    # and cannot be obtained solely from 'ip address show' output.
-    if 'interfaces' in network_info and network_info['interfaces']:
-        logging.info(
-            f"Successfully retrieved info for {len(network_info['interfaces'])} interfaces.")
-    elif 'errors' not in network_info:
-        logging.info("No network interfaces found.")
+                stats_entry["bytes_sent_rate_bps"] = round(bytes_sent_delta / time_delta, 2)
+                stats_entry["bytes_recv_rate_bps"] = round(bytes_recv_delta / time_delta, 2)
+                stats_entry["packets_sent_rate_pps"] = round(packets_sent_delta / time_delta, 2)
+                stats_entry["packets_recv_rate_pps"] = round(packets_recv_delta / time_delta, 2)
 
-    return network_info
+                errin_delta = current_stats.errin - last_stats.errin
+                errout_delta = current_stats.errout - last_stats.errout
+                dropin_delta = current_stats.dropin - last_stats.dropin
+                dropout_delta = current_stats.dropout - last_stats.dropout
+
+                stats_entry["errors_in_rate_pps"] = round(errin_delta / time_delta, 2)
+                stats_entry["errors_out_rate_pps"] = round(errout_delta / time_delta, 2)
+                stats_entry["drops_in_rate_pps"] = round(dropin_delta / time_delta, 2)
+                stats_entry["drops_out_rate_pps"] = round(dropout_delta / time_delta, 2)
+
+                stats_entry["health_status"] = self._assess_network_health(
+                    name,
+                    stats_entry["errors_in_rate_pps"],
+                    stats_entry["errors_out_rate_pps"],
+                    stats_entry["drops_in_rate_pps"],
+                    stats_entry["drops_out_rate_pps"]
+                )
+            else:
+                logging.debug(f"No previous stats for interface '{name}' or zero time_delta. Rates are 0.")
+
+            interfaces_stats.append(stats_entry)
+
+        # Update last counters and timestamp for the next call
+        self._last_net_io_counters = current_net_io_counters
+        self._last_net_io_timestamp = current_timestamp
+
+        return {"interfaces_stats": interfaces_stats}
+
+    @staticmethod
+    def _assess_network_health(interface_name: str, errin_rate: float, errout_rate: float, dropin_rate: float, dropout_rate: float) -> str:
+        """
+        Assesses the health of a network interface based on error and drop rates.
+        Thresholds are illustrative and should be tuned for specific environments.
+        """
+        # Define thresholds for warning and critical levels
+        WARN_RATE_THRESHOLD = 0.1 # Example: 0.1 errors/drops per second
+        CRIT_RATE_THRESHOLD = 0.5 # Example: 0.5 errors/drops per second
+
+        if (errin_rate >= CRIT_RATE_THRESHOLD or errout_rate >= CRIT_RATE_THRESHOLD) or \
+           (dropin_rate >= CRIT_RATE_THRESHOLD or dropout_rate >= CRIT_RATE_THRESHOLD):
+            return "CRITICAL"
+        elif (errin_rate >= WARN_RATE_THRESHOLD or errout_rate >= WARN_RATE_THRESHOLD) or \
+             (dropin_rate >= WARN_RATE_THRESHOLD or dropout_rate >= WARN_RATE_THRESHOLD):
+            return "WARNING"
+        return "OK"
+
+    def get_overall_network_health(self) -> str:
+        """
+        Provides an overall network health assessment based on all interfaces' current statistics.
+        This method will call get_interface_stats to get the latest data.
+        """
+        # Call get_interface_stats. The time_delta calculation is now handled internally
+        # by get_interface_stats based on its last call.
+        current_stats_report = self.get_interface_stats()
+
+        if "interfaces_stats" in current_stats_report:
+            has_critical = False
+            has_warning = False
+            for iface in current_stats_report["interfaces_stats"]:
+                status = iface.get("health_status", "N/A")
+                if status == "CRITICAL":
+                    has_critical = True
+                    break # Critical overrides everything, no need to check further
+                elif status == "WARNING":
+                    has_warning = True
+
+            if has_critical:
+                return "OVERALL: CRITICAL - At least one network interface is severely impacted."
+            elif has_warning:
+                return "OVERALL: WARNING - Some network interfaces show minor issues."
+
+        return "OVERALL: OK - Network appears healthy."
+
+
+# --- Dedicated Classes for Non-IP Network Protocols ---
+
+class CANbusMonitor:
+    """
+    Monitors CAN bus activity, including status, message counts, and error frames.
+    Requires 'python-can' library and appropriate hardware interface (e.g., CAN adapter).
+    """
+    def __init__(self, channel: str = 'can0', bustype: str = 'socketcan'):
+        self._channel = channel
+        self._bustype = bustype
+        self._bus_instance = None
+        self._last_rx_count = 0
+        self._last_tx_count = 0
+        self._last_error_count = 0
+        self._last_timestamp = time.monotonic()
+        logging.info(f"CANbusMonitor initialized for {bustype}:{channel}.")
+
+    def _connect_bus(self):
+        """Attempts to establish connection to the CAN bus."""
+        if not CAN_LIB_AVAILABLE:
+            logging.error("CAN bus monitoring failed: 'python-can' library not installed.")
+            raise ImportError("python-can library is required for CANbusMonitor.")
+
+        try:
+            # Example: self._bus_instance = can.interface.Bus(channel=self._channel, bustype=self._bustype)
+            # In a real implementation, you'd try to connect here.
+            # For now, simulate a successful connection for the example.
+            logging.warning("Simulating CAN bus connection. Actual 'python-can' interaction is not implemented.")
+            self._bus_instance = True # Placeholder for a successful bus object
+        except Exception as e:
+            logging.error(f"Failed to connect to CAN bus {self._channel} ({self._bustype}): {e}")
+            self._bus_instance = None
+
+    def get_status_and_stats(self) -> Dict[str, Any]:
+        """
+        Retrieves current CAN bus status and statistics (flow, errors, drops).
+        """
+        if self._bus_instance is None:
+            try:
+                self._connect_bus() # Try to connect on demand
+                if self._bus_instance is None: # If connection failed
+                    return {"name": f"CANbus({self._channel})", "status": "DISCONNECTED", "error": "Could not connect to CAN bus."}
+            except ImportError as e:
+                 return {"name": f"CANbus({self._channel})", "status": "UNAVAILABLE", "error": str(e)}
+
+        current_timestamp = time.monotonic()
+        time_delta = current_timestamp - self._last_timestamp
+
+        # --- Simulate CAN data ---
+        # In a real scenario, you'd read from self._bus_instance
+        # Example: bus_stats = self._bus_instance.get_stats() (if API exists)
+        # Or, listen to messages and count them.
+        sim_rx_count = self._last_rx_count + 10 # Simulate messages
+        sim_tx_count = self._last_tx_count + 5
+        sim_error_count = self._last_error_count + (1 if current_timestamp % 5 < 1 else 0) # Simulate occasional error
+
+        rx_delta = sim_rx_count - self._last_rx_count
+        tx_delta = sim_tx_count - self._last_tx_count
+        error_delta = sim_error_count - self._last_error_count
+
+        msg_rx_rate = round(rx_delta / time_delta, 2) if time_delta > 0 else 0.0
+        msg_tx_rate = round(tx_delta / time_delta, 2) if time_delta > 0 else 0.0
+        error_rate = round(error_delta / time_delta, 2) if time_delta > 0 else 0.0
+
+        status = {
+            "name": f"CANbus({self._channel})",
+            "status": "CONNECTED", # Or from bus_instance state
+            "total_messages_received": sim_rx_count,
+            "total_messages_sent": sim_tx_count,
+            "total_error_frames": sim_error_count,
+            "messages_received_rate_msg_per_sec": msg_rx_rate,
+            "messages_sent_rate_msg_per_sec": msg_tx_rate,
+            "error_frame_rate_err_per_sec": error_rate,
+            "health_status": "OK" if error_rate < 0.1 else "WARNING" # Basic health
+        }
+
+        # Update last counts
+        self._last_rx_count = sim_rx_count
+        self._last_tx_count = sim_tx_count
+        self._last_error_count = sim_error_count
+        self._last_timestamp = current_timestamp
+
+        return status
+
+class SerialPortMonitor:
+    """
+    Monitors a Serial (RS232) port, including status, byte counts, and communication errors.
+    Requires 'pyserial' library and a valid serial port.
+    """
+    def __init__(self, port: str = '/dev/ttyS0', baudrate: int = 9600):
+        self._port = port
+        self._baudrate = baudrate
+        self._serial_instance = None
+        self._last_rx_bytes = 0
+        self._last_tx_bytes = 0
+        self._last_error_count = 0 # Placeholder for parity/framing errors
+        self._last_timestamp = time.monotonic()
+        logging.info(f"SerialPortMonitor initialized for {port} @ {baudrate} baud.")
+
+    def _connect_port(self):
+        """Attempts to establish connection to the serial port."""
+        if not SERIAL_LIB_AVAILABLE:
+            logging.error("Serial port monitoring failed: 'pyserial' library not installed.")
+            raise ImportError("pyserial library is required for SerialPortMonitor.")
+
+        try:
+            # Example: self._serial_instance = serial.Serial(self._port, self._baudrate, timeout=0.1)
+            # For now, simulate a successful connection.
+            logging.warning("Simulating serial port connection. Actual 'pyserial' interaction is not implemented.")
+            self._serial_instance = True # Placeholder for a successful serial object
+            # self._serial_instance.read() to clear buffers on start if needed
+        except Exception as e:
+            logging.error(f"Failed to open serial port {self._port}: {e}")
+            self._serial_instance = None
+
+    def get_status_and_stats(self) -> Dict[str, Any]:
+        """
+        Retrieves current serial port status and statistics (flow, errors).
+        """
+        if self._serial_instance is None:
+            try:
+                self._connect_port() # Try to connect on demand
+                if self._serial_instance is None: # If connection failed
+                    return {"name": f"SerialPort({self._port})", "status": "DISCONNECTED", "error": "Could not open serial port."}
+            except ImportError as e:
+                return {"name": f"SerialPort({self._port})", "status": "UNAVAILABLE", "error": str(e)}
+
+        current_timestamp = time.monotonic()
+        time_delta = current_timestamp - self._last_timestamp
+
+        # --- Simulate Serial data ---
+        # In a real scenario, you'd read from self._serial_instance.
+        # This usually involves non-blocking reads and tracking bytes.
+        sim_rx_bytes = self._last_rx_bytes + 20 # Simulate bytes
+        sim_tx_bytes = self._last_tx_bytes + 10
+        sim_error_count = self._last_error_count + (1 if current_timestamp % 7 < 1 else 0) # Simulate occasional error
+
+        rx_delta = sim_rx_bytes - self._last_rx_bytes
+        tx_delta = sim_tx_bytes - self._last_tx_bytes
+        error_delta = sim_error_count - self._last_error_count
+
+        bytes_rx_rate = round(rx_delta / time_delta, 2) if time_delta > 0 else 0.0
+        bytes_tx_rate = round(tx_delta / time_delta, 2) if time_delta > 0 else 0.0
+        error_rate = round(error_delta / time_delta, 2) if time_delta > 0 else 0.0
+
+        status = {
+            "name": f"SerialPort({self._port})",
+            "status": "OPEN", # Or from serial_instance.is_open
+            "total_bytes_received": sim_rx_bytes,
+            "total_bytes_sent": sim_tx_bytes,
+            "total_comm_errors": sim_error_count, # e.g., framing, parity errors
+            "bytes_received_rate_Bps": bytes_rx_rate,
+            "bytes_sent_rate_Bps": bytes_tx_rate,
+            "comm_error_rate_err_per_sec": error_rate,
+            "health_status": "OK" if error_rate < 0.1 else "WARNING" # Basic health
+        }
+
+        # Update last counts
+        self._last_rx_bytes = sim_rx_bytes
+        self._last_tx_bytes = sim_tx_bytes
+        self._last_error_count = sim_error_count
+        self._last_timestamp = current_timestamp
+
+        return status
 
 
 # Example of how to use the function (for testing purposes)
 if __name__ == "__main__":
     print("Gathering network information...")
-    net_info = get_network_info()
+    net_manager = NetworkManager()
 
-    import json
-    print("\n--- Network Information (JSON Output) ---")
-    print(json.dumps(net_info, indent=4))
+    # --- 1. Get Static IP Network Interface Configuration ---
+    print("\n--- 1. IP Network Interface Configuration (Static) ---")
+    config_info = net_manager.get_interface_config()
+    print(json.dumps(config_info, indent=4))
 
-    # Example of processing the results
-    if 'interfaces' in net_info:
-        print("\n--- Summary ---")
-        for iface in net_info['interfaces']:
-            name = iface.get('name', 'N/A')
-            state = iface.get('state', 'N/A')
-            mac = iface.get('mac_address', 'N/A')
-            print(f"Interface: {name}")
-            print(f"  State: {state}")
-            print(f"  MAC Address: {mac}")
-            addresses = iface.get('addresses', [])
-            if addresses:
-                print("  IP Addresses:")
-                for addr in addresses:
-                    print(
-                        f"    {addr.get('family', 'N/A')}: {addr.get('cidr', 'N/A')}")
+    # --- 2. Get Real-time IP Network Interface Statistics ---
+    print("\n--- 2. IP Network Interface Statistics (Live - First sample with rates=0) ---")
+    # First call will populate _last_net_io_counters and _last_net_io_timestamp.
+    # Rates will be 0 as there's no previous delta.
+    stats_info_first = net_manager.get_interface_stats()
+    print(json.dumps(stats_info_first, indent=4))
+
+    print("\n--- 2a. IP Network Interface Statistics (Live - after 1 second, rates available) ---")
+    # Wait for 1 second to ensure a meaningful time_delta for rate calculation
+    time.sleep(1)
+    stats_info_second = net_manager.get_interface_stats() # Now rates will be calculated
+    print(json.dumps(stats_info_second, indent=4))
+
+    # --- 3. Overall IP Network Health ---
+    print("\n--- 3. Overall IP Network Health ---")
+    overall_health = net_manager.get_overall_network_health()
+    print(json.dumps({"overall_health": overall_health}, indent=4))
+
+    # --- 4. Non-IP Network Monitoring ---
+    print("\n--- 4. Non-IP Network Monitoring ---")
+    print("\n--- CAN Bus Monitoring ---")
+    can_monitor = CANbusMonitor()
+    # Call get_status_and_stats multiple times with a delay to see rates change
+    can_stats_first = can_monitor.get_status_and_stats()
+    print(json.dumps(can_stats_first, indent=4))
+    time.sleep(1)
+    can_stats_second = can_monitor.get_status_and_stats()
+    print(json.dumps(can_stats_second, indent=4))
+
+    print("\n--- Serial Port (RS232) Monitoring ---")
+    serial_monitor = SerialPortMonitor()
+    serial_stats_first = serial_monitor.get_status_and_stats()
+    print(json.dumps(serial_stats_first, indent=4))
+    time.sleep(1)
+    serial_stats_second = serial_monitor.get_status_and_stats()
+    print(json.dumps(serial_stats_second, indent=4))
+
+    # --- Summary Processing (updated to reflect new structure) ---
+    print("\n--- Consolidated Summary ---")
+    print("\nIP Network Interfaces:")
+    if "interfaces" in config_info:
+        for iface_config in config_info["interfaces"]:
+            name = iface_config.get('name', 'N/A')
+
+            # Find corresponding live stats from the second sample
+            current_live_stats = next(
+                (item for item in stats_info_second.get("interfaces_stats", []) if item["name"] == name),
+                None
+            )
+
+            print(f"  Interface: {name}")
+            print(f"    MAC: {iface_config.get('mac_address', 'N/A')}")
+            print(f"    State: {'UP' if iface_config.get('is_up') else 'DOWN'}")
+
+            if iface_config.get('addresses'):
+                print("    IPs:")
+                for addr in iface_config['addresses']:
+                    print(f"      {addr.get('family')}: {addr.get('address')}/{addr.get('cidr') if addr.get('cidr') else addr.get('netmask')}")
+
+            if current_live_stats:
+                print(f"    Rates (Bps/pps): Tx {current_live_stats.get('bytes_sent_rate_bps', 0):.2f}/{current_live_stats.get('packets_sent_rate_pps', 0):.2f} | Rx {current_live_stats.get('bytes_recv_rate_bps', 0):.2f}/{current_live_stats.get('packets_recv_rate_pps', 0):.2f}")
+                print(f"    Errors/Drops (pps): In {current_live_stats.get('errors_in_rate_pps', 0):.2f} / Out {current_live_stats.get('errors_out_rate_pps', 0):.2f} | Drop In {current_live_stats.get('drops_in_rate_pps', 0):.2f} / Drop Out {current_live_stats.get('drops_out_rate_pps', 0):.2f}")
+                print(f"    Health: {current_live_stats.get('health_status', 'N/A')}")
             else:
-                print("  No IP Addresses assigned.")
-            print("-" * 10)
+                print("    Live stats not available or initial sample.")
+            print("    " + "-" * 15)
 
-    if 'errors' in net_info:
-        print("\n--- Errors ---")
-        for error in net_info['errors']:
-            print(f"- {error}")
+    print("\nCAN Bus Status:")
+    print(json.dumps(can_stats_second, indent=2)) # Use the second sample
 
-    if 'info' in net_info:
-        print(f"\n--- Info ---\n{net_info['info']}")
-
-    if 'ifconfig_fallback_raw_output' in net_info:
-        print("\n--- ifconfig Fallback Raw Output ---")
-        print(net_info['ifconfig_fallback_raw_output'])
+    print("\nSerial Port Status:")
+    print(json.dumps(serial_stats_second, indent=2)) # Use the second sample

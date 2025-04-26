@@ -14,574 +14,482 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""
+Storage Self-Check Module for Autonomous Driving Systems.
+
+This module provides a comprehensive check of storage devices (HDDs/SSDs)
+to ensure their health, performance, and reliability, which are critical for
+safe and robust autonomous vehicle operations.
+
+It assesses:
+- Device connectivity and identification (lsblk).
+- Filesystem available space (df).
+- Real-time I/O performance (throughput and latency via psutil).
+- Hardware health and estimated lifetime (S.M.A.R.T. via smartctl).
+
+The final output is a structured report and a clear, actionable overall
+health status for the entire storage subsystem.
+"""
+
 import logging
-import re       # Needed for parsing key="value" format or df/fstab
-from typing import Dict, List, Any
+import re
+import time
+import json
+import subprocess
+from typing import Dict, List, Any, Optional, Tuple
+from dataclasses import dataclass, field, asdict
 
-from whl_env.utils import run_command
+# --- Dependency Check ---
+try:
+    import psutil
+except ImportError:
+    logging.critical("CRITICAL: The 'psutil' library is required. System health monitoring cannot proceed.")
+    # In a real system, this would trigger a major fault.
+    raise
 
+# --- Module Configuration ---
+# Configure basic logging for standalone execution. In a larger system,
+# this would be handled by a central logging configuration.
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - [%(funcName)s] - %(message)s'
+)
 
-# Configure basic logging if not already configured
-# In a real application, you would configure logging more elaborately
-logging.basicConfig(level=logging.INFO,
-                    format='%(asctime)s - %(levelname)s - %(message)s')
-
-# Define paths for system files
+# Constants
 FSTAB_PATH = '/etc/fstab'
+SMARTCTL_TIMEOUT = 20  # Increased timeout for potentially slow S.M.A.R.T. commands
+COMMAND_TIMEOUT = 10   # General command timeout
 
-# --- Helper function to parse lsblk -P output ---
+# --- Data Models (Dataclasses for Clarity and Type Safety) ---
 
+@dataclass
+class FilesystemUsage:
+    """Represents usage data for a mounted filesystem."""
+    device: str
+    mount_point: str
+    total_bytes: int
+    used_bytes: int
+    available_bytes: int
+    use_percentage: float
 
-def parse_lsblk_pairs(output: str) -> List[Dict[str, str]]:
+@dataclass
+class FstabEntry:
+    """Represents a single entry from /etc/fstab."""
+    device: str
+    mount_point: str
+    fstype: str
+    options: str
+    dump: str
+    pass_no: str
+
+@dataclass
+class IOStats:
+    """Represents real-time I/O statistics for a device."""
+    device_name: str
+    read_bytes_per_sec: float
+    write_bytes_per_sec: float
+    read_ops_per_sec: float
+    write_ops_per_sec: float
+    read_latency_ms_per_op: float
+    write_latency_ms_per_op: float
+
+@dataclass
+class SmartInfo:
+    """Represents S.M.A.R.T. health information for a disk."""
+    health_status: str  # PASSED, FAILED, WARNING
+    attributes: List[Dict[str, Any]] = field(default_factory=list)
+    lifetime: Dict[str, Any] = field(default_factory=dict)
+    model_name: Optional[str] = None
+    serial_number: Optional[str] = None
+    temperature_celsius: Optional[int] = None
+    critical_issues: List[str] = field(default_factory=list)
+    error: Optional[str] = None
+
+@dataclass
+class Partition:
+    """Represents a disk partition."""
+    name: str
+    full_path: str
+    type: str
+    size_bytes: int
+    size_gb: float
+    mount_point: Optional[str] = None
+    filesystem_type: Optional[str] = None
+    usage: Optional[FilesystemUsage] = None
+    fstab_entry: Optional[FstabEntry] = None
+    io_stats: Optional[IOStats] = None
+    note: Optional[str] = None
+
+@dataclass
+class Disk:
+    """Represents a physical storage disk."""
+    name: str
+    full_path: str
+    type: str
+    size_bytes: int
+    size_gb: float
+    model: str
+    vendor: str
+    is_rotational: bool
+    partitions: List[Partition] = field(default_factory=list)
+    io_stats: Optional[IOStats] = None
+    smart_info: Optional[SmartInfo] = None
+    mount_point: Optional[str] = None  # For disks mounted directly
+
+@dataclass
+class StorageHealthReport:
+    """The final, consolidated report."""
+    overall_status: str  # HEALTHY, WARNING, CRITICAL
+    disks: List[Disk]
+    other_devices: List[Partition] # For loop devices, LVMs, etc.
+    summary: Dict[str, Any]
+    errors: List[str]
+
+# --- Main Class for Storage Self-Check ---
+
+class StorageManager:
     """
-    Parses the key="value" output format from lsblk -P.
-
-    Args:
-        output: The raw string output from lsblk -P.
-
-    Returns:
-        A list of dictionaries, where each dictionary represents a device
-        or partition and contains key-value pairs from lsblk.
+    Performs a comprehensive self-check of the vehicle's storage subsystem.
     """
-    parsed_data: List[Dict[str, str]] = []
-    lines = output.strip().split('\n')
-    # Regex to find key="value" pairs, handling spaces inside quotes
-    # \w+ : one or more word characters (keys like NAME, SIZE, etc.)
-    # "([^"]*)" : quotes around the value, capturing anything inside that is not a quote
-    pair_regex = re.compile(r'(\w+)="([^"]*)"')
+    def __init__(self):
+        self._last_disk_io_counters: Dict[str, psutil._common.sdiskio] = {}
+        self._last_disk_io_timestamp: float = time.monotonic()
+        # Initialize with first sample to enable rate calculation on the first real check.
+        self.get_disk_io_stats()
+        logging.info("StorageManager initialized and first I/O sample taken.")
 
-    for line in lines:
-        if not line.strip():
-            continue
-        device_info: Dict[str, str] = {}
-        # Find all key="value" pairs in the line
-        matches = pair_regex.findall(line)
-        for key, value in matches:
-            device_info[key] = value.strip()  # Store stripped value
+    def _run_command(self, cmd: List[str], timeout: int, allow_sudo: bool = False) -> Tuple[str, str, int]:
+        """A robust, unified command execution wrapper."""
+        if cmd[0] == 'sudo' and not allow_sudo:
+            err_msg = f"Command with 'sudo' is not permitted: {' '.join(cmd)}"
+            logging.error(err_msg)
+            return "", err_msg, -1
 
-        if device_info:  # Only add if the line actually contained parseable info
-            parsed_data.append(device_info)
-            logging.debug(
-                f"Parsed lsblk device line: {device_info.get('NAME')}")
+        try:
+            process = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=timeout
+            )
+            return process.stdout.strip(), process.stderr.strip(), process.returncode
+        except FileNotFoundError:
+            return "", f"Command not found: '{cmd[0]}'", 127
+        except subprocess.TimeoutExpired:
+            return "", f"Command timed out after {timeout}s: {' '.join(cmd)}", -2
+        except Exception as e:
+            return "", f"Unexpected error running command: {e}", -3
 
-    return parsed_data
+    def get_block_devices(self) -> Tuple[List[Dict[str, Any]], List[str]]:
+        """Retrieves block device info using 'lsblk'."""
+        devices, errors = [], []
+        cmd = ['lsblk', '-b', '-P', '-o', 'NAME,SIZE,TYPE,MOUNTPOINT,FSTYPE,MODEL,VENDOR,ROTA']
+        output, error, code = self._run_command(cmd, COMMAND_TIMEOUT)
 
-# --- Function to get block device info using lsblk ---
+        if code == 0 and output:
+            for line in output.strip().split('\n'):
+                dev_raw = {k: v for k, v in re.findall(r'(\w+)="([^"]*)"', line)}
+                if not dev_raw: continue
 
+                try:
+                    size_bytes = int(dev_raw.get('SIZE', 0))
+                    devices.append({
+                        'name': dev_raw.get('NAME', 'N/A'),
+                        'full_path': f"/dev/{dev_raw.get('NAME', '')}",
+                        'type': dev_raw.get('TYPE', 'unknown'),
+                        'size_bytes': size_bytes,
+                        'size_gb': round(size_bytes / (1024**3), 2),
+                        'mount_point': dev_raw.get('MOUNTPOINT', '').strip() or None,
+                        'filesystem_type': dev_raw.get('FSTYPE', '').strip() or None,
+                        'model': dev_raw.get('MODEL', 'N/A').strip(),
+                        'vendor': dev_raw.get('VENDOR', 'N/A').strip(),
+                        'is_rotational': dev_raw.get('ROTA') == '1',
+                    })
+                except (ValueError, TypeError) as e:
+                    errors.append(f"Failed to parse lsblk line '{line}': {e}")
+        elif code != 0:
+            errors.append(f"lsblk command failed (code {code}): {error}")
 
-def get_disk_info_lsblk() -> Dict[str, Any]:
-    """
-    Retrieves basic block device information (name, size, type, mountpoint, fstype, model)
-    by running the 'lsblk' command with key="value" output format.
+        return devices, errors
 
-    Returns:
-        A dictionary containing:
-        - 'devices': A list of dictionaries, each representing a block device
-                     or partition with keys like 'name', 'size_bytes', 'type',
-                     'mount_point', 'filesystem_type', 'model'.
-        - 'errors': A list of strings for any errors encountered.
-    """
-    storage_info: Dict[str, Any] = {}
-    disk_list: List[Dict[str, Any]] = []
-    errors: List[str] = []
+    def get_filesystem_usage(self) -> Tuple[List[FilesystemUsage], List[str]]:
+        """Retrieves filesystem usage using 'df'."""
+        filesystems, errors = [], []
+        # Using psutil.disk_partitions() and psutil.disk_usage() is more robust and portable
+        try:
+            partitions = psutil.disk_partitions()
+            for part in partitions:
+                if 'loop' in part.device: continue # Often not relevant for autoware
+                usage = psutil.disk_usage(part.mountpoint)
+                filesystems.append(FilesystemUsage(
+                    device=part.device,
+                    mount_point=part.mountpoint,
+                    total_bytes=usage.total,
+                    used_bytes=usage.used,
+                    available_bytes=usage.free,
+                    use_percentage=usage.percent
+                ))
+        except Exception as e:
+            errors.append(f"Failed to get filesystem usage via psutil: {e}")
+        return filesystems, errors
 
-    # Use lsblk to list block devices.
-    # -b: print size in bytes (unambiguous)
-    # -P: use key="value" output format (easy to parse)
-    # -o: specify output columns (NAME, SIZE, TYPE, MOUNTPOINT, FSTYPE, MODEL)
-    # We use 'NAME' as the primary identifier, 'SIZE' in bytes,
-    # 'TYPE' (disk, part, loop, etc.), 'MOUNTPOINT' (where it's mounted),
-    # 'FSTYPE' (filesystem type), 'MODEL' (disk model).
-    lsblk_cmd = ['lsblk', '-b', '-P', '-o',
-                 'NAME,SIZE,TYPE,MOUNTPOINT,FSTYPE,MODEL']
-    logging.info(f"Running command: {' '.join(lsblk_cmd)}")
-    output = run_command(lsblk_cmd, timeout=10)
+    def get_disk_io_stats(self) -> Dict[str, IOStats]:
+        """Calculates real-time disk I/O statistics using psutil."""
+        io_stats_map = {}
+        try:
+            current_counters = psutil.disk_io_counters(perdisk=True)
+            current_timestamp = time.monotonic()
+            time_delta = current_timestamp - self._last_disk_io_timestamp
 
-    if output:
-        logging.info("lsblk command successful. Parsing output...")
-        # Parse the key="value" output format
-        disk_list_raw = parse_lsblk_pairs(output)
+            if time_delta > 0:
+                for name, stats in current_counters.items():
+                    if name in self._last_disk_io_counters:
+                        last_stats = self._last_disk_io_counters[name]
+                        read_bytes_delta = stats.read_bytes - last_stats.read_bytes
+                        write_bytes_delta = stats.write_bytes - last_stats.write_bytes
+                        read_count_delta = stats.read_count - last_stats.read_count
+                        write_count_delta = stats.write_count - last_stats.write_count
+                        read_time_delta = stats.read_time - last_stats.read_time
+                        write_time_delta = stats.write_time - last_stats.write_time
 
-        for dev_info_raw in disk_list_raw:
-            dev_info: Dict[str, Any] = {}
-            # Extract and process information from the raw parsed data
-            dev_info['name'] = dev_info_raw.get('NAME', 'N/A')
-            dev_info['type'] = dev_info_raw.get(
-                'TYPE', 'unknown')  # e.g., disk, part, loop
+                        io_stats_map[name] = IOStats(
+                            device_name=name,
+                            read_bytes_per_sec=read_bytes_delta / time_delta,
+                            write_bytes_per_sec=write_bytes_delta / time_delta,
+                            read_ops_per_sec=read_count_delta / time_delta,
+                            write_ops_per_sec=write_count_delta / time_delta,
+                            read_latency_ms_per_op=read_time_delta / read_count_delta if read_count_delta > 0 else 0,
+                            write_latency_ms_per_op=write_time_delta / write_count_delta if write_count_delta > 0 else 0,
+                        )
 
-            # Safely convert size to integer (lsblk -b gives bytes)
-            size_bytes_str = dev_info_raw.get('SIZE', '0')
-            try:
-                dev_info['size_bytes'] = int(size_bytes_str)
-            except ValueError:
-                dev_info['size_bytes'] = 0
-                errors.append(
-                    f"Could not parse size '{size_bytes_str}' for device {dev_info['name']}")
-                logging.warning(errors[-1])
+            self._last_disk_io_counters = current_counters
+            self._last_disk_io_timestamp = current_timestamp
+        except Exception as e:
+            logging.error(f"Failed to get disk I/O stats: {e}")
+        return io_stats_map
 
-            # Add convenience size in GB (round to 2 decimal places)
-            dev_info['size_gb'] = round(
-                dev_info['size_bytes'] / (1024**3), 2) if dev_info['size_bytes'] > 0 else 0.0
+    def get_smart_info(self, device_path: str) -> SmartInfo:
+        """Retrieves and parses S.M.A.R.T. data using 'smartctl'."""
+        cmd = ['sudo', 'smartctl', '-a', '-j', device_path]
+        output, error, code = self._run_command(cmd, SMARTCTL_TIMEOUT, allow_sudo=True)
 
-            # MOUNTPOINT and FSTYPE can be empty/None if not mounted or no FS
-            # lsblk -P uses "" for empty values, convert to None or empty string as preferred
-            mount_point_raw = dev_info_raw.get('MOUNTPOINT', '')
-            dev_info['mount_point'] = mount_point_raw if mount_point_raw != '' else None
+        if code != 0 or not output:
+            return SmartInfo(health_status="UNKNOWN", error=f"smartctl failed (code {code}): {error}")
 
-            fstype_raw = dev_info_raw.get('FSTYPE', '')
-            dev_info['filesystem_type'] = fstype_raw if fstype_raw != '' else None
+        try:
+            data = json.loads(output)
+            passed = data.get('smart_status', {}).get('passed', False)
+            health_status = "PASSED" if passed else "FAILED"
 
-            # Disk model name (only for TYPE=disk)
-            dev_info['model'] = dev_info_raw.get('MODEL', 'N/A')
+            # Parse key lifetime and identity attributes
+            lifetime = {
+                'power_on_hours': data.get('power_on_time', {}).get('hours'),
+                'power_cycle_count': data.get('power_cycle_count'),
+                'data_units_written': data.get('nvme_smart_health_information_log', {}).get('data_units_written'),
+                'percentage_used': data.get('nvme_smart_health_information_log', {}).get('percentage_used'),
+            }
+            # Remove None values for cleaner output
+            lifetime = {k: v for k, v in lifetime.items() if v is not None}
 
-            disk_list.append(dev_info)
+            # Parse attributes and identify critical issues
+            attributes = data.get('ata_smart_attributes', {}).get('table', [])
+            critical_issues = []
+            critical_attr_names = {
+                'Reallocated_Sector_Ct', 'Current_Pending_Sector_Ct',
+                'Offline_Uncorrectable', 'Reported_Uncorrect'
+            }
+            for attr in attributes:
+                if attr.get('name') in critical_attr_names and attr.get('raw', {}).get('value', 0) > 0:
+                    critical_issues.append(f"{attr['name']} is {attr['raw']['value']}")
 
-        storage_info['devices'] = disk_list
-    else:  # success is True but output is empty - indicates no block devices?
-        info_msg = "lsblk returned no output. No block devices found?"
-        storage_info['info'] = info_msg
-        logging.warning(info_msg)
+            # For NVMe, check critical warnings from the log
+            nvme_log = data.get('nvme_smart_health_information_log', {})
+            if nvme_log.get('critical_warning', 0) > 0:
+                 critical_issues.append(f"NVMe Critical Warning Flags: {nvme_log['critical_warning']}")
 
-    if errors:
-        storage_info['errors'] = errors
+            if critical_issues and health_status == "PASSED":
+                health_status = "WARNING"
 
-    return storage_info
+            return SmartInfo(
+                health_status=health_status,
+                attributes=attributes,
+                lifetime=lifetime,
+                model_name=data.get('model_name'),
+                serial_number=data.get('serial_number'),
+                temperature_celsius=data.get('temperature', {}).get('current'),
+                critical_issues=critical_issues
+            )
+        except json.JSONDecodeError:
+            return SmartInfo(health_status="UNKNOWN", error="Failed to parse smartctl JSON output.")
+        except Exception as e:
+            return SmartInfo(health_status="UNKNOWN", error=f"Unexpected error parsing SMART data: {e}")
 
+    @staticmethod
+    def _get_parent_disk_name(partition_name: str) -> Optional[str]:
+        """Deduces parent disk name from a partition name (e.g., sda1 -> sda)."""
+        match = re.match(r'^(nvme\d+n\d+)p\d+', partition_name) or \
+                re.match(r'^([a-z]+)\d+', partition_name)
+        return match.group(1) if match else None
 
-# --- Function to get filesystem usage info using df ---
-def get_filesystem_usage() -> Dict[str, Any]:
-    """
-    Retrieves filesystem usage information (total, used, available space)
-    for mounted filesystems using the 'df' command.
+    def run_self_check(self) -> StorageHealthReport:
+        """
+        Executes the full storage self-check and returns a comprehensive report.
+        """
+        logging.info("Starting storage self-check...")
+        all_errors = []
 
-    Returns:
-        A dictionary containing:
-        - 'filesystems': A list of dictionaries, each representing a mounted filesystem
-                         with keys like 'device', 'mount_point', 'total_bytes',
-                         'used_bytes', 'available_bytes', 'use_percentage'.
-        - 'errors': A list of strings for any errors encountered.
-    """
-    fs_usage_info: Dict[str, Any] = {}
-    fs_list: List[Dict[str, Any]] = []
-    errors: List[str] = []
+        # 1. Gather all data
+        block_devices_raw, errors = self.get_block_devices()
+        all_errors.extend(errors)
 
-    # Use df to get filesystem disk space usage
-    # -P: Use POSIX output format (consistent columns)
-    # -B1: Report sizes in 1-byte blocks (unambiguous)
-    # Output columns (with -P): Filesystem, 1-blocks, Used, Available, Capacity, Mounted on
-    df_cmd = ['df', '-P', '-B1']
-    logging.info(f"Running command: {' '.join(df_cmd)}")
-    output = run_command(df_cmd, timeout=10)
+        fs_usage, errors = self.get_filesystem_usage()
+        all_errors.extend(errors)
 
-    if output:
-        logging.info("df command successful. Parsing output...")
-        lines = output.strip().split('\n')
-        if len(lines) > 1:  # Skip header line
-            # Not strictly needed due to fixed order with -P
-            header = lines[0].split()
-            data_lines = lines[1:]
+        io_stats = self.get_disk_io_stats()
 
-            for line in data_lines:
-                if not line.strip():
-                    continue
-                # Split line by whitespace. With -P, the last column is Mountpoint,
-                # which can potentially contain spaces (less common, but possible).
-                # A simple split might break if the device path has spaces,
-                # but typically device paths don't. Mount points can.
-                # df -P puts Mountpoint last, so split(None, 5) splits by whitespace
-                # into 6 parts, the last being the Mountpoint.
-                # Split into at most 6 parts by any whitespace
-                parts = line.split(None, 5)
+        # 2. Build device hierarchy
+        disks: List[Disk] = []
+        other_devices: List[Partition] = []
+        partitions_map: Dict[str, List[Partition]] = {}
 
-                if len(parts) == 6:
-                    try:
-                        # Columns: Filesystem, 1-blocks, Used, Available, Capacity, Mounted on
-                        device_name = parts[0]
-                        total_bytes = int(parts[1])
-                        used_bytes = int(parts[2])
-                        available_bytes = int(parts[3])
-                        # Capacity is 'Use%', remove '%' and convert to float
-                        use_percentage = float(parts[4].replace('%', ''))
-                        mount_point = parts[5]  # Last part is the mount point
+        # Create Disk objects and map for their partitions
+        for dev_raw in block_devices_raw:
+            if dev_raw['type'] == 'disk':
+                disk = Disk(**{k: v for k, v in dev_raw.items() if k in Disk.__annotations__})
+                disks.append(disk)
+                partitions_map[disk.name] = disk.partitions
 
-                        fs_info: Dict[str, Any] = {
-                            'device': device_name,  # e.g., /dev/sda1, tmpfs
-                            'mount_point': mount_point,  # e.g., /, /home, /mnt/data
-                            'total_bytes': total_bytes,
-                            'used_bytes': used_bytes,
-                            'available_bytes': available_bytes,
-                            'use_percentage': use_percentage
-                        }
-                        fs_list.append(fs_info)
-                        logging.debug(f"Parsed df entry: {mount_point}")
-
-                    except (ValueError, IndexError) as e:
-                        errors.append(
-                            f"Error parsing df output line '{line}': {e}")
-                        logging.error(errors[-1])
+        # Create Partition objects and assign them
+        for dev_raw in block_devices_raw:
+            if dev_raw['type'] == 'part':
+                part = Partition(**{k: v for k, v in dev_raw.items() if k in Partition.__annotations__})
+                parent_name = self._get_parent_disk_name(part.name)
+                if parent_name and parent_name in partitions_map:
+                    partitions_map[parent_name].append(part)
                 else:
-                    errors.append(
-                        f"df output format unexpected for line (expected 6 parts, got {len(parts)}): {line}")
-                    logging.warning(errors[-1])
+                    part.note = "Parent disk not recognized."
+                    other_devices.append(part)
+            elif dev_raw['type'] not in ['disk', 'part']:
+                # Handle loop, lvm, etc.
+                dev = Partition(**{k: v for k, v in dev_raw.items() if k in Partition.__annotations__})
+                other_devices.append(dev)
 
-        elif len(lines) == 1:
-            # Only header line received, no mounted filesystems listed
-            logging.info(
-                "df command returned only header, no mounted filesystems found.")
-        else:
-            # Should not happen if output is not empty and > 1 line check passed
-            pass  # Handled by empty output check below
-    else:  # success is True but output is empty
-        info_msg = "df returned no output. No mounted filesystems?"
-        fs_usage_info['info'] = info_msg
-        logging.warning(info_msg)
+        # 3. Augment with collected data
+        all_devs = disks + other_devices
+        usage_lookup = {fs.mount_point: fs for fs in fs_usage}
 
-    fs_usage_info['filesystems'] = fs_list
-    if errors:
-        fs_usage_info['errors'] = errors
+        for dev in all_devs:
+            # Augment partitions if the device is a disk
+            if isinstance(dev, Disk):
+                for part in dev.partitions:
+                    part.io_stats = io_stats.get(part.name)
+                    if part.mount_point and part.mount_point in usage_lookup:
+                        part.usage = usage_lookup[part.mount_point]
+                # Augment the disk itself
+                dev.io_stats = io_stats.get(dev.name)
+                dev.smart_info = self.get_smart_info(dev.full_path)
+            # Augment other top-level devices (partitions, LVMs)
+            elif isinstance(dev, Partition):
+                dev.io_stats = io_stats.get(dev.name)
+                if dev.mount_point and dev.mount_point in usage_lookup:
+                    dev.usage = usage_lookup[dev.mount_point]
 
-    return fs_usage_info
+        # 4. Assess overall health
+        overall_status = "HEALTHY"
+        summary = {"critical_issues": [], "warning_issues": []}
 
+        for disk in disks:
+            # Critical: S.M.A.R.T. failure or critical errors
+            if disk.smart_info:
+                if disk.smart_info.health_status == "FAILED":
+                    overall_status = "CRITICAL"
+                    summary["critical_issues"].append(f"Disk {disk.name}: S.M.A.R.T. check failed.")
+                elif disk.smart_info.health_status == "WARNING":
+                    if overall_status != "CRITICAL": overall_status = "WARNING"
+                    summary["warning_issues"].append(f"Disk {disk.name}: S.M.A.R.T. warnings: {disk.smart_info.critical_issues}")
+                if disk.smart_info.error:
+                     if overall_status != "CRITICAL": overall_status = "WARNING"
+                     summary["warning_issues"].append(f"Disk {disk.name}: Could not retrieve S.M.A.R.T. data.")
 
-# --- Function to parse /etc/fstab ---
-def parse_fstab() -> Dict[str, Any]:
-    """
-    Parses the /etc/fstab file to get static filesystem configuration entries.
-    Does not check if filesystems are currently mounted or accessible.
+            # Critical: Key filesystems (e.g., root, data log) over 95% full
+            for part in disk.partitions:
+                if part.usage and part.usage.use_percentage > 95:
+                    overall_status = "CRITICAL"
+                    summary["critical_issues"].append(f"Filesystem at {part.mount_point} is critically full ({part.usage.use_percentage}%).")
+                elif part.usage and part.usage.use_percentage > 85:
+                    if overall_status != "CRITICAL": overall_status = "WARNING"
+                    summary["warning_issues"].append(f"Filesystem at {part.mount_point} is nearly full ({part.usage.use_percentage}%).")
 
-    Returns:
-        A dictionary containing:
-        - 'entries': A list of dictionaries, each representing an fstab entry
-                     with keys like 'device', 'mount_point', 'fstype', 'options',
-                     'dump', 'pass_no'.
-        - 'errors': A list of strings for any errors encountered.
-                     (e.g., file not found, parsing issues).
-    """
-    fstab_entries: List[Dict[str, str]] = []
-    errors: List[str] = []
-    fstab_info: Dict[str, Any] = {}
+        logging.info(f"Storage self-check completed. Overall status: {overall_status}")
 
-    try:
-        logging.info(f"Attempting to read {FSTAB_PATH}")
-        with open(FSTAB_PATH, 'r') as f:
-            for line_num, line in enumerate(f, 1):
-                line = line.strip()
-                # Skip comment lines and empty lines
-                if not line or line.startswith('#'):
-                    continue
+        return StorageHealthReport(
+            overall_status=overall_status,
+            disks=disks,
+            other_devices=other_devices,
+            summary=summary,
+            errors=all_errors
+        )
 
-                # Split line by whitespace. Standard fstab has 6 fields.
-                # Fields: fs_spec, fs_file, fs_vfstype, fs_mntops, fs_freq, fs_passno
-                parts = line.split()
-
-                # Basic check for expected number of fields (at least 2 are mandatory)
-                # A standard entry has 6 fields.
-                if len(parts) >= 2:
-                    entry: Dict[str, str] = {
-                        # fs_spec - device, UUID, LABEL etc.
-                        'device': parts[0],
-                        'mount_point': parts[1],   # fs_file - mount point
-                        # fs_vfstype - filesystem type
-                        'fstype': parts[2] if len(parts) > 2 else 'auto',
-                        # fs_mntops - mount options
-                        'options': parts[3] if len(parts) > 3 else 'defaults',
-                        # fs_freq - dump frequency
-                        'dump': parts[4] if len(parts) > 4 else '0',
-                        # fs_passno - fsck pass number
-                        'pass_no': parts[5] if len(parts) > 5 else '0'
-                    }
-                    fstab_entries.append(entry)
-                    logging.debug(
-                        f"Parsed fstab entry: {entry.get('mount_point')}")
-
-                else:
-                    # Log malformed lines
-                    errors.append(
-                        f"Malformed line in {FSTAB_PATH} (line {line_num}, expected >=2 fields): {line}")
-                    logging.warning(errors[-1])
-
-    except FileNotFoundError:
-        err_msg = f'{FSTAB_PATH} not found. Cannot get static filesystem configuration.'
-        errors.append(err_msg)
-        logging.error(err_msg)
-    except Exception as e:
-        err_msg = f'An unexpected error occurred while reading or parsing {FSTAB_PATH}: {e}'
-        errors.append(err_msg)
-        logging.error(err_msg)
-
-    fstab_info['entries'] = fstab_entries
-    if errors:
-        fstab_info['errors'] = errors
-
-    return fstab_info
-
-
-# --- Main function to combine storage information ---
-def get_storage_status() -> Dict[str, Any]:
-    """
-    Gathers comprehensive storage status including block device information
-    from lsblk, filesystem usage from df, and static configuration from fstab.
-
-    Note: This function provides configuration and usage data.
-    Checking read/write speed requires performing benchmarks, which is NOT
-    included here.
-
-    Returns:
-        A dictionary containing storage information.
-        Example Structure:
-        {
-            'devices': [ # From lsblk, augmented with df and fstab info
-                 {
-                     'name': 'sda',
-                     'type': 'disk',
-                     'size_bytes': ...,
-                     'size_gb': ...,
-                     'model': '...',
-                     'partitions': [
-                         {
-                             'name': 'sda1',
-                             'type': 'part',
-                             'size_bytes': ...,
-                             'size_gb': ...,
-                             'mount_point': '/', # If mounted
-                             'filesystem_type': 'ext4', # If has FS
-                             'usage': { # If mounted and found in df
-                                 'total_bytes': ...,
-                                 'used_bytes': ...,
-                                 'available_bytes': ...,
-                                 'use_percentage': ...
-                             },
-                             'fstab': { # If found in fstab
-                                 'device': '/dev/sda1',
-                                 'mount_point': '/',
-                                 'fstype': 'ext4',
-                                 'options': 'defaults',
-                                 'dump': '0',
-                                 'pass_no': '1'
-                             }
-                         },
-                         ...
-                     ]
-                 },
-                 ...
-            ],
-            'filesystems_usage': [ # List of all mounted filesystems from df
-                 {
-                     'device': '/dev/sda1',
-                     'mount_point': '/',
-                     'total_bytes': ...,
-                     'used_bytes': ...,
-                     'available_bytes': ...,
-                     'use_percentage': ...
-                 },
-                 ...
-            ],
-            'fstab_entries': [ # List of all entries from /etc/fstab
-                 {
-                     'device': 'UUID=...',
-                     'mount_point': '/home',
-                     'fstype': 'ext4',
-                     'options': 'defaults',
-                     'dump': '0',
-                     'pass_no': '2'
-                 },
-                 ...
-            ],
-            'errors': ['List of errors from lsblk, df, fstab parsing']
-        }
-    """
-    # 1. Get block device info (disks, partitions, etc.)
-    lsblk_result = get_disk_info_lsblk()
-    devices = lsblk_result.get('devices', [])
-    all_errors = lsblk_result.get('errors', [])
-
-    # 2. Get filesystem usage info for mounted filesystems
-    df_result = get_filesystem_usage()
-    filesystems_usage = df_result.get('filesystems', [])
-    all_errors.extend(df_result.get('errors', []))
-
-    # 3. Parse static fstab entries
-    fstab_result = parse_fstab()
-    fstab_entries = fstab_result.get('entries', [])
-    all_errors.extend(fstab_result.get('errors', []))
-
-    # 4. Augment lsblk data with df and fstab info
-    # Create lookup dictionaries for easier matching
-    usage_lookup = {fs['mount_point']: fs for fs in filesystems_usage}
-    # Matching fstab requires checking both device and mount point, and handling different device specs (name, UUID, LABEL)
-    # A simple lookup by mount_point might find the most relevant fstab entry for a mounted FS.
-    fstab_lookup_by_mount = {entry['mount_point']                             : entry for entry in fstab_entries}
-    # Consider adding lookup by device name/UUID/LABEL if needed for non-mounted fstab entries
-
-    # Build a hierarchical structure or just augment the flat list?
-    # Augmenting the flat list is simpler and matches the original structure closer.
-    # Let's augment the 'devices' list from lsblk results.
-
-    # Iterate through devices/partitions from lsblk
-    for device in devices:
-        # If the device/partition has a mount point according to lsblk
-        mount_point = device.get('mount_point')
-        if mount_point:
-            # Try to find corresponding usage info from df results (match by mount point)
-            usage_info = usage_lookup.get(mount_point)
-            if usage_info:
-                device['usage'] = usage_info
-                logging.debug(
-                    f"Augmented {device.get('name')} ({mount_point}) with usage info.")
-
-            # Try to find corresponding fstab entry (match by mount point)
-            fstab_entry = fstab_lookup_by_mount.get(mount_point)
-            # Additional check: does the fstab entry's device specification match this lsblk device name?
-            # This is complex due to UUIDs/LABELs. For simplicity, just adding the fstab entry found by mount point for now.
-            # More robust matching would involve resolving UUIDs/LABELs to /dev/ names.
-            if fstab_entry:
-                # Basic check if the lsblk name or its parent disk name is mentioned in the fstab device spec
-                # This check is imperfect but better than just matching mount point alone
-                fstab_device_spec = fstab_entry.get('device', '')
-                lsblk_name = device.get('name', '')
-
-                # Simple heuristic: check if lsblk name is a substring of fstab spec (e.g., sda1 in /dev/sda1, or sda in UUID=...)
-                # A better approach would be to resolve UUID/LABEL from fstab using blkid and match /dev/ paths.
-                # Sticking to simple check for completion based on the request.
-                # Let's add the fstab entry if mount points match, but add a warning if device spec doesn't look right.
-                device['fstab'] = fstab_entry
-                # Optional: Add a check/warning if fstab device spec doesn't seem to match
-                # if not (lsblk_name in fstab_device_spec or fstab_device_spec.startswith(f'/dev/{lsblk_name}')):
-                #      logging.warning(f"Fstab entry for mount point {mount_point} references device '{fstab_device_spec}', which might not directly match lsblk name '{lsblk_name}'.")
-
-        # You could optionally build a hierarchical structure here if needed,
-        # linking partitions to their parent disks based on NAME (e.g., sda vs sda1)
-        # This requires iterating through devices and nesting 'part' types under 'disk' types.
-        # For this request, augmenting the flat list is sufficient to show related info.
-
-    # 5. Final result structure
-    result: Dict[str, Any] = {
-        'devices': devices,  # Augmented list from lsblk
-        'filesystems_usage': filesystems_usage,  # Flat list from df
-        'fstab_entries': fstab_entries  # Flat list from fstab
-    }
-
-    if all_errors:
-        result['errors'] = all_errors
-
-    # Add info message if no devices were found by lsblk
-    if not devices and not all_errors:
-        result['info'] = "No block devices detected by lsblk."
-        logging.info(result['info'])
-
-    # --- Note on Read/Write Speed ---
-    # Checking read/write speed is a performance test that requires active I/O operations (benchmarking).
-    # This cannot be determined by simply listing device/filesystem properties with tools like lsblk or df.
-    # Tools for benchmarking include:
-    # - `dd` (simple sequential test)
-    # - `fio` (flexible I/O tester, complex configuration)
-    # - `ioping` (latency check)
-    # - Specific filesystem benchmarks (e.g., bonnie++, iozone)
-    # Implementing a benchmark is outside the scope of gathering system information.
-    # The caller would need to perform these tests separately on the relevant mount points/devices.
-    result['note_speed_check'] = (
-        "Read/write speed requires active benchmarking tools (e.g., dd, fio, ioping)"
-        " and cannot be determined from configuration/usage data provided here."
-    )
-
-    return result
-
-
-# Example of how to use the function (for testing purposes)
+# --- Main execution block for standalone testing ---
 if __name__ == "__main__":
-    print("Gathering storage status information...")
-    storage_status = get_storage_status()
+    print("="*60)
+    print("  AUTONOMOUS DRIVING STORAGE SUBSYSTEM SELF-CHECK")
+    print("="*60)
 
-    import json
-    print("\n--- Storage Status (JSON Output) ---")
-    print(json.dumps(storage_status, indent=4))
+    storage_manager = StorageManager()
 
-    # Example of processing the results
-    print("\n--- Summary of Devices ---")
-    if storage_status.get('devices'):
-        for device in storage_status['devices']:
-            name = device.get('name', 'N/A')
-            dev_type = device.get('type', 'N/A')
-            size_gb = device.get('size_gb')
-            model = device.get('model', 'N/A')
+    # Allow a short period for I/O stats to accumulate a baseline
+    print("\n[INFO] Waiting for 2 seconds to gather initial I/O statistics...")
+    time.sleep(2)
 
-            print(f"Device: {name} (Type: {dev_type})")
-            if size_gb is not None:
-                print(
-                    f"  Size: {size_gb} GB ({device.get('size_bytes', 'N/A')} bytes)")
-            if model != 'N/A' and dev_type == 'disk':  # Only show model for disks
-                print(f"  Model: {model}")
+    # Run the comprehensive check
+    print("[INFO] Performing comprehensive storage self-check...")
+    report = storage_manager.run_self_check()
 
-            # If it's a partition or mounted device, show mount info
-            mount_point = device.get('mount_point')
-            fstype = device.get('filesystem_type')
-            if mount_point:
-                print(f"  Mounted on: {mount_point} (FS: {fstype})")
+    # Convert report to a dictionary for JSON serialization
+    # asdict is a helper from dataclasses to convert nested dataclasses to dicts
+    report_dict = asdict(report)
 
-            # Show usage info if available (added from df)
-            usage = device.get('usage')
-            if usage:
-                total_gb = round(usage.get('total_bytes', 0) / (1024**3), 2)
-                used_gb = round(usage.get('used_bytes', 0) / (1024**3), 2)
-                available_gb = round(
-                    usage.get('available_bytes', 0) / (1024**3), 2)
-                use_percent = usage.get('use_percentage')
-                print(
-                    f"  Usage: {used_gb} GB used / {available_gb} GB available ({use_percent}%)")
-                print(
-                    f"  Total FS Size: {total_gb} GB ({usage.get('total_bytes', 'N/A')} bytes)")
+    print("\n--- JSON Report ---")
+    print(json.dumps(report_dict, indent=2))
 
-            # Show fstab info if available
-            fstab = device.get('fstab')
-            if fstab:
-                print(f"  fstab Entry:")
-                print(f"    Device: {fstab.get('device')}")
-                print(f"    Mount Point: {fstab.get('mount_point')}")
-                print(f"    FS Type: {fstab.get('fstype')}")
-                print(f"    Options: {fstab.get('options')}")
+    print("\n--- Human-Readable Summary ---")
+    print(f"Overall Storage Health: {report.overall_status}")
 
-            # Note about partitions hierarchy is not built here
-            # print("  Partitions: (Hierarchy not built in this view)") # Could list partition names here if implemented
+    if report.summary['critical_issues']:
+        print("\nCRITICAL ISSUES DETECTED:")
+        for issue in report.summary['critical_issues']:
+            print(f"  - [CRITICAL] {issue}")
 
-            print("-" * 20)
-    elif storage_status.get('info'):
-        print(f"\n--- Info ---\n{storage_status['info']}")
+    if report.summary['warning_issues']:
+        print("\nWARNINGS DETECTED:")
+        for issue in report.summary['warning_issues']:
+            print(f"  - [WARNING] {issue}")
 
-    print("\n--- Summary of Mounted Filesystems (from df) ---")
-    if storage_status.get('filesystems_usage'):
-        for fs in storage_status['filesystems_usage']:
-            total_gb = round(fs.get('total_bytes', 0) / (1024**3), 2)
-            used_gb = round(fs.get('used_bytes', 0) / (1024**3), 2)
-            available_gb = round(fs.get('available_bytes', 0) / (1024**3), 2)
-            use_percent = fs.get('use_percentage')
+    if report.errors:
+        print("\nERRORS DURING SELF-CHECK:")
+        for err in report.errors:
+            print(f"  - {err}")
 
-            print(f"Mount Point: {fs.get('mount_point', 'N/A')}")
-            print(f"  Device: {fs.get('device', 'N/A')}")
-            print(
-                f"  Total Size: {total_gb} GB ({fs.get('total_bytes', 'N/A')} bytes)")
-            print(
-                f"  Usage: {used_gb} GB used / {available_gb} GB available ({use_percent}%)")
-            print("-" * 20)
-    elif 'info' not in storage_status:  # Avoid repeating info if already shown
-        print("No mounted filesystems reported by df.")
+    print("\n--- Detailed Device Status ---")
+    for disk in report.disks:
+        print(f"\n[DISK] {disk.name} ({disk.model}) - Size: {disk.size_gb} GB")
+        if disk.smart_info:
+            print(f"  - S.M.A.R.T. Health: {disk.smart_info.health_status}")
+            print(f"  - Temperature: {disk.smart_info.temperature_celsius}°C")
+            print(f"  - Power On Hours: {disk.smart_info.lifetime.get('power_on_hours', 'N/A')}")
+            if disk.smart_info.lifetime.get('percentage_used') is not None:
+                print(f"  - SSD Lifetime Used: {disk.smart_info.lifetime['percentage_used']}%")
+        if disk.io_stats:
+            print(f"  - I/O (r/w Bps): {disk.io_stats.read_bytes_per_sec:.0f} / {disk.io_stats.write_bytes_per_sec:.0f}")
 
-    print("\n--- Summary of fstab Entries ---")
-    if storage_status.get('fstab_entries'):
-        for entry in storage_status['fstab_entries']:
-            print(f"fstab Entry:")
-            print(f"  Device: {entry.get('device')}")
-            print(f"  Mount Point: {entry.get('mount_point')}")
-            print(f"  FS Type: {entry.get('fstype')}")
-            print(f"  Options: {entry.get('options')}")
-            print("-" * 20)
-    elif 'info' not in storage_status:
-        print(f"No entries found in {FSTAB_PATH}.")
+        for part in disk.partitions:
+            mount_info = f"at {part.mount_point}" if part.mount_point else "Not mounted"
+            print(f"  - [PART] {part.name} ({part.size_gb} GB, {part.filesystem_type}) - {mount_info}")
+            if part.usage:
+                print(f"    - Usage: {part.usage.use_percentage}% full ({part.usage.available_bytes / (1024**3):.2f} GB free)")
 
-    if storage_status.get('errors'):
-        print("\n--- Errors ---")
-        for error in storage_status['errors']:
-            print(f"- {error}")
-
-    if storage_status.get('note_speed_check'):
-        print(f"\n--- Note ---")
-        print(storage_status['note_speed_check'])
+    print("\n" + "="*60)
+    print("  SELF-CHECK COMPLETE")
+    print("="*60)

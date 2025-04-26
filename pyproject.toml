@@ -20,7 +20,8 @@ classifiers = [
 ]
 requires-python = ">=3.6"
 dependencies = [
-  # todo: add dependencies
+  "nvidia-ml-py3",
+  "psutil",
 ]
 
 keywords = ["whl_env", "wheelos",]

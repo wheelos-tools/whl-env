@@ -15,176 +15,119 @@
 # limitations under the License.
 
 import logging
-from typing import Dict, Any
+import json
+from typing import Dict, Any, Optional
 
-# Configure basic logging if not already configured
-# In a real application, you would configure logging more elaborately
-logging.basicConfig(level=logging.INFO,
-                    format='%(asctime)s - %(levelname)s - %(message)s')
+# psutil is the industry-standard, cross-platform library for this task.
+try:
+    import psutil
+except ImportError:
+    print("Error: The 'psutil' library is required. Please install it with 'pip install psutil'")
+    exit(1)
 
-# Define the path to the memory information file
-MEMINFO_PATH = '/proc/meminfo'
+# Configure basic logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-
-def get_memory_info() -> Dict[str, Any]:
+class Memory:
     """
-    Retrieves detailed memory information by parsing /proc/meminfo.
-    Includes total, free, available, swap, etc.
-    Getting memory type/speed usually requires tools like dmidecode or parsing BIOS info,
-    which is complex and often requires root privileges. This function does not provide that.
+    A class to retrieve comprehensive memory information, focusing on usage,
+    performance metrics, and health status, without requiring special privileges.
 
-    Returns:
-        A dictionary containing memory information parsed from /proc/meminfo,
-        including values in both kB and bytes (for some key fields),
-        and potentially an error message if reading or parsing fails.
-        Example structure:
-        {
-            'MemTotal_kb': 16384000,
-            'MemFree_kb': 10000000,
-            'MemAvailable_kb': 12000000,
-            'SwapTotal_kb': 8192000,
-            'SwapFree_kb': 8192000,
-            'MemTotal_bytes': 16777216000,
-            'total_memory_gb': 15.63, # Convenience field
-            'raw_meminfo': { # Optional: Store all parsed values as strings or integers
-                'MemTotal': '16384000 kB',
-                'MemFree': '10000000 kB',
-                ...
-            },
-            'errors': ['List of any errors encountered'] # Optional
-        }
+    This implementation relies exclusively on cross-platform libraries and standard
+    OS interfaces, making it robust and secure for general-purpose monitoring.
     """
-    mem_info: Dict[str, Any] = {}
-    # To store all key-value pairs as strings
-    raw_mem_stats: Dict[str, str] = {}
-    parsed_kb_stats: Dict[str, int] = {}  # To store numerical values in kB
+    def __init__(self):
+        """Initializes the Memory monitor."""
+        # You can add one-time initializations here if needed.
+        logging.info("Memory monitor initialized. Ready to get usage data.")
 
-    KB_TO_BYTES = 1024
-    KB_TO_GB = 1024**2  # 1024 * 1024
+    def get_usage_and_health(self) -> Dict[str, Any]:
+        """
+        Retrieves system-wide memory usage statistics using psutil.
+        This includes physical memory (RAM) and swap space, along with a health assessment.
 
-    try:
-        logging.info(f"Attempting to read {MEMINFO_PATH}")
-        with open(MEMINFO_PATH, 'r') as f:
-            content = f.read()
+        Returns:
+            A dictionary containing detailed usage and health metrics.
+        """
+        try:
+            # psutil's virtual_memory() returns a named tuple with bytes as units.
+            vm = psutil.virtual_memory()
+            swap = psutil.swap_memory()
 
-        # Parse /proc/meminfo content
-        # Each line is typically in the format "Key: Value Units" (e.g., "MemTotal: 16384000 kB")
-        lines = content.strip().split('\n')
-        for line in lines:
-            if not line:
-                continue  # Skip empty lines
+            # 'available' is what applications can use without causing swapping.
+            # (total - available) is a more accurate metric for "used" by applications.
+            app_used_memory = vm.total - vm.available
 
-            # Split each line by the first colon
-            parts = line.split(':', 1)
-            if len(parts) == 2:
-                key = parts[0].strip()
-                value_str = parts[1].strip()
+            usage_info = {
+                "physical_memory": {
+                    "total_gb": round(vm.total / (1024**3), 2),
+                    "available_gb": round(vm.available / (1024**3), 2),
+                    "used_gb": round(app_used_memory / (1024**3), 2),
+                    "percent_used": round((app_used_memory / vm.total) * 100, 2),
+                    # Provide details on how memory is allocated internally
+                    # Use getattr for robustness if some fields are not present on all systems/versions
+                    "internal_usage_gb": {
+                        "buffers": round(getattr(vm, 'buffers', 0) / (1024**3), 2),
+                        "cached": round(getattr(vm, 'cached', 0) / (1024**3), 2),
+                        "shared": round(getattr(vm, 'shared', 0) / (1024**3), 2),
+                    }
+                },
+                "swap_memory": {
+                    "total_gb": round(swap.total / (1024**3), 2),
+                    "used_gb": round(swap.used / (1024**3), 2),
+                    "percent_used": swap.percent,
+                },
+                "health": {
+                    "status": self._assess_health(vm, swap), # vm and swap are psutil.svmem and psutil.sswap NamedTuple instances
+                    "notes": "Health status is based on memory pressure. High usage of swap or very low available memory indicates potential performance issues."
+                },
+                "physical_specs": {
+                    "info": "Retrieving physical memory details (type, speed, manufacturer) requires tools like 'dmidecode' and administrative privileges, which are not used in this function."
+                }
+            }
+            return usage_info
+        except Exception as e:
+            logging.error(f"Failed to get memory usage via psutil: {e}")
+            return {"error": f"Failed to get memory usage: {e}"}
 
-                # Store the raw string value
-                raw_mem_stats[key] = value_str
+    @staticmethod
+    def _assess_health(vm: Any, swap: Any) -> str: # <--- CHANGED HERE
+        """
+        Provides a simple health assessment based on memory pressure.
+        This logic can be customized based on specific workload requirements.
+        """
+        # Calculate available memory percentage, which is a key health indicator.
+        available_percent = (vm.available / vm.total) * 100
 
-                # Attempt to parse numerical value (usually the first part before units)
-                value_parts = value_str.split()
-                if value_parts:
-                    try:
-                        # The numerical value is typically the first part
-                        value_kb = int(value_parts[0])
-                        # Store in kB with suffix
-                        parsed_kb_stats[f"{key}_kb"] = value_kb
-
-                    except ValueError:
-                        logging.warning(
-                            f"Could not parse integer value for '{key}': {value_str}")
-                        # Optionally store non-parsable values under a different key or log as error
-                        # mem_info[f"{key}_raw"] = value_str # Example
-
-            else:
-                logging.warning(
-                    f"Skipping malformed line in {MEMINFO_PATH}: {line}")
-
-        # Add relevant parsed stats (in kB and bytes) to the main result dictionary
-        for key_kb, value_kb in parsed_kb_stats.items():
-            mem_info[key_kb] = value_kb
-            # Add corresponding value in bytes for common fields
-            if key_kb in ['MemTotal_kb', 'MemFree_kb', 'MemAvailable_kb', 'SwapTotal_kb', 'SwapFree_kb']:
-                mem_info[key_kb.replace('_kb', '_bytes')
-                         ] = value_kb * KB_TO_BYTES
-
-        # Add convenience field for total memory in GB
-        total_kb = parsed_kb_stats.get('MemTotal_kb')
-        if total_kb is not None:
-            mem_info['total_memory_gb'] = round(total_kb / KB_TO_GB, 2)
-        else:
-            # MemTotal_kb was not found or not parsable
-            error_msg = f"Could not find or parse 'MemTotal' from {MEMINFO_PATH}."
-            mem_info.setdefault('errors', []).append(error_msg)
-            logging.error(error_msg)
-
-        # Optionally include the raw parsed stats dictionary
-        # mem_info['raw_meminfo'] = raw_mem_stats # Uncomment if needed
-
-        # As noted previously, memory type/speed cannot be reliably obtained from /proc/meminfo
-        mem_info['type'] = 'N/A (Requires dmidecode or specific tools)'
-        mem_info['speed'] = 'N/A (Requires dmidecode or specific tools)'
-
-    except FileNotFoundError:
-        error_msg = f'{MEMINFO_PATH} not found. Cannot get memory info on this system.'
-        # Keep original error key for backward compatibility
-        mem_info['error'] = error_msg
-        mem_info.setdefault('errors', []).append(error_msg)
-        logging.error(error_msg)
-    except Exception as e:
-        error_msg = f'An unexpected error occurred while reading or parsing {MEMINFO_PATH}: {e}'
-        mem_info['error'] = error_msg  # Keep original error key
-        mem_info.setdefault('errors', []).append(error_msg)
-        logging.error(error_msg)
-
-    # Ensure 'errors' key exists even if empty, for consistent structure
-    mem_info.setdefault('errors', [])
-
-    return mem_info
+        if available_percent < 5 or swap.percent > 50:
+            return "CRITICAL"
+        elif available_percent < 15 or swap.percent > 25:
+            return "WARNING"
+        return "OK"
 
 
-# Example of how to use the function (for testing purposes)
+def main():
+    """Main function to demonstrate the Memory class."""
+    print("Initializing Memory monitor (no sudo required)...")
+    memory_monitor = Memory()
+
+    print("\n--- Memory Usage and Health Report ---")
+    report = memory_monitor.get_usage_and_health()
+    print(json.dumps(report, indent=4))
+
+    # Example of processing the detailed results
+    if "error" not in report:
+        print("\n--- Summary ---")
+        phys_mem = report.get("physical_memory", {})
+        health = report.get("health", {})
+
+        print(f"Physical Memory: {phys_mem.get('used_gb', 'N/A')} GB Used / {phys_mem.get('total_gb', 'N/A')} GB Total ({phys_mem.get('percent_used', 'N/A')}%)")
+        print(f"Available for Apps: {phys_mem.get('available_gb', 'N/A')} GB")
+        print(f"Health Status: {health.get('status', 'N/A')}")
+
+        swap_mem = report.get("swap_memory", {})
+        if swap_mem.get("total_gb", 0) > 0:
+            print(f"Swap Usage: {swap_mem.get('used_gb', 'N/A')} GB Used / {swap_mem.get('total_gb', 'N/A')} GB Total ({swap_mem.get('percent_used', 'N/A')}%)")
+
 if __name__ == "__main__":
-    print("Gathering memory information...")
-    mem_info = get_memory_info()
-
-    import json
-    print("\n--- Memory Information (JSON Output) ---")
-    print(json.dumps(mem_info, indent=4))
-
-    # Example of processing the results
-    print("\n--- Summary ---")
-    total_gb = mem_info.get('total_memory_gb')
-    total_kb = mem_info.get('MemTotal_kb')
-    free_kb = mem_info.get('MemFree_kb')
-    available_kb = mem_info.get('MemAvailable_kb')
-    swap_total_kb = mem_info.get('SwapTotal_kb')
-    swap_free_kb = mem_info.get('SwapFree_kb')
-
-    if total_gb is not None:
-        print(f"Total Physical Memory: {total_gb} GB ({total_kb} kB)")
-    elif total_kb is not None:
-        print(f"Total Physical Memory: {total_kb} kB")
-    else:
-        print("Total Physical Memory: N/A")
-
-    if free_kb is not None:
-        print(f"Free Physical Memory: {free_kb} kB")
-    if available_kb is not None:
-        print(f"Available Physical Memory (est.): {available_kb} kB")
-    if swap_total_kb is not None:
-        print(f"Total Swap Memory: {swap_total_kb} kB")
-    if swap_free_kb is not None:
-        print(f"Free Swap Memory: {swap_free_kb} kB")
-
-    if mem_info.get('type'):
-        print(f"Memory Type: {mem_info['type']}")
-    if mem_info.get('speed'):
-        print(f"Memory Speed: {mem_info['speed']}")
-
-    if mem_info.get('errors'):
-        print("\n--- Errors ---")
-        for error in mem_info['errors']:
-            print(f"- {error}")
+    main()

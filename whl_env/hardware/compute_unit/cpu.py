@@ -15,296 +15,215 @@
 # limitations under the License.
 
 import logging
-from typing import Dict, Any, List, Optional, Tuple
+import platform
+import time
+import json
+from typing import Dict, Any, List, Optional, NamedTuple
 
-# Configure basic logging if not already configured
-# In a real application, you would configure logging more elaborately
-logging.basicConfig(level=logging.INFO,
-                    format='%(asctime)s - %(levelname)s - %(message)s')
+try:
+    import psutil
+except ImportError:
+    print("Error: The 'psutil' library is required. Please install it using 'pip install psutil'")
+    exit(1)
 
-# Define the path to the CPU information file
-CPUINFO_PATH = '/proc/cpuinfo'
+# Configure basic logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
+class CPUTimes(NamedTuple):
+    """Represents CPU time statistics."""
+    user: float
+    system: float
+    idle: float
+    interrupt: Optional[float]
+    dpc: Optional[float]
 
-def _parse_cpuinfo_block(block_content: str) -> Dict[str, str]:
+class CPU:
     """
-    Parses a single block of /proc/cpuinfo content into a key-value dictionary.
-    A block corresponds to information for one logical processor.
+    A class to represent and retrieve comprehensive CPU information,
+    including specifications, real-time frequency, temperature, and load.
 
-    Args:
-        block_content: A string containing the content of a single processor block.
-
-    Returns:
-        A dictionary where keys are the /proc/cpuinfo field names (stripped)
-        and values are the corresponding field values (stripped).
+    This implementation prefers `psutil` for its reliability and cross-platform
+    compatibility, falling back to manual parsing for specific details if needed.
     """
-    block_info: Dict[str, str] = {}
-    lines = block_content.strip().split('\n')
-    for line in lines:
-        if not line.strip():  # Skip empty lines within a block (shouldn't be any normally)
-            continue
-        # Split each line by the first colon
-        parts = line.split(':', 1)
-        if len(parts) == 2:
-            key = parts[0].strip()
-            value = parts[1].strip()
-            block_info[key] = value
-        else:
-            # Log malformed lines within a block
-            logging.warning(
-                f"Skipping malformed line in cpuinfo block: {line}")
-    return block_info
+    def __init__(self):
+        self._physical_cores: int = psutil.cpu_count(logical=False)
+        self._logical_cores: int = psutil.cpu_count(logical=True)
+        # Note: psutil does not directly expose socket count. We'll rely on
+        # parsing /proc/cpuinfo for that specific, static detail.
+        self._sockets: int = self._get_socket_count()
+        self._model_name: str = self._get_cpu_model_name()
 
+    @staticmethod
+    def _get_cpu_model_name() -> str:
+        """
+        Retrieves the CPU model name, trying various sources for robustness.
+        This is a static piece of information, so it's fine to get it once.
+        """
+        # In Linux, /proc/cpuinfo is the most reliable source for the model name.
+        if platform.system() == "Linux":
+            try:
+                with open('/proc/cpuinfo', 'r') as f:
+                    for line in f:
+                        if "model name" in line:
+                            return line.split(':')[1].strip()
+            except Exception as e:
+                logging.warning(f"Could not read model name from /proc/cpuinfo: {e}")
 
-def get_cpu_info() -> Dict[str, Any]:
-    """
-    Retrieves detailed CPU information by parsing /proc/cpuinfo.
-    Includes model name, vendor, core counts (logical, physical, sockets),
-    current frequency, and basic family/model/stepping info.
+        # Fallback for other systems or if /proc/cpuinfo fails
+        # A more comprehensive solution might use `platform.processor()` but it can be less descriptive.
+        return "Unknown"
 
-    Returns:
-        A dictionary containing CPU information, or an error message if reading or parsing fails.
-        Example Structure:
-        {
-            'model_name': 'Intel(R) Core(TM) i7-8700K CPU @ 3.70GHz',
-            'vendor_id': 'GenuineIntel',
-            'cpu_family': '6',
-            'model': '158',
-            'stepping': '10',
-            'logical_cores': 12,      # Total threads (e.g., 6 cores * 2 threads)
-            'physical_cores': 6,      # Total physical cores across all sockets
-            'sockets': 1,             # Total physical CPU packages
-            'physical_cores_per_socket': 6, # Value from 'cpu cores' in cpuinfo
-            'current_frequency_mhz': 3700.00, # Current speed (can vary)
-            'errors': ['List of any errors encountered during parsing'] # Optional
+    @staticmethod
+    def _get_socket_count() -> int:
+        """
+        Parses /proc/cpuinfo to determine the number of physical sockets.
+        This is one detail not easily available in psutil.
+        """
+        if platform.system() != "Linux":
+            logging.info("Socket count detection is only supported on Linux.")
+            return 1 # Assume 1 socket on non-Linux systems for basic functionality.
+
+        try:
+            with open('/proc/cpuinfo', 'r') as f:
+                content = f.read()
+
+            physical_ids = set()
+            for line in content.splitlines():
+                if line.startswith("physical id"):
+                    physical_id = line.split(':')[1].strip()
+                    physical_ids.add(physical_id)
+
+            # If `physical id` is not found, assume a single-socket system.
+            return len(physical_ids) if physical_ids else 1
+        except FileNotFoundError:
+            logging.error("/proc/cpuinfo not found. Cannot determine socket count.")
+            return 1 # Fallback
+        except Exception as e:
+            logging.error(f"Error parsing /proc/cpuinfo for socket count: {e}")
+            return 1 # Fallback
+
+    def get_specs(self) -> Dict[str, Any]:
+        """
+        Returns the static specifications of the CPU.
+        """
+        return {
+            "model_name": self._model_name,
+            "architecture": platform.machine(),
+            "physical_cores": self._physical_cores,
+            "logical_cores": self._logical_cores,
+            "sockets": self._sockets,
+            "physical_cores_per_socket": self._physical_cores // self._sockets if self._sockets > 0 else 0
         }
-    """
-    cpu_info: Dict[str, Any] = {}
-    errors: List[str] = []
 
-    try:
-        logging.info(f"Attempting to read {CPUINFO_PATH}")
-        with open(CPUINFO_PATH, 'r') as f:
-            content = f.read()
+    @staticmethod
+    def get_frequency() -> Dict[str, Optional[float]]:
+        """
+        Gets current, min, and max CPU frequency in MHz.
 
-        # /proc/cpuinfo contains a block of information for each logical processor (thread).
-        # Blocks are typically separated by one or more empty lines.
-        processor_blocks = [
-            block.strip() for block in content.strip().split('\n\n') if block.strip()]
+        Returns:
+            A dictionary with 'current', 'min', and 'max' frequency.
+            Values can be None if the information is not available.
+        """
+        try:
+            freq = psutil.cpu_freq()
+            return {
+                "current_mhz": freq.current,
+                "min_mhz": freq.min,
+                "max_mhz": freq.max
+            }
+        except (AttributeError, NotImplementedError):
+            logging.warning("CPU frequency information not available on this system via psutil.")
+            return {"current_mhz": None, "min_mhz": None, "max_mhz": None}
 
-        if not processor_blocks:
-            err_msg = f'Could not parse {CPUINFO_PATH} into processor blocks or file is empty.'
-            cpu_info['error'] = err_msg
-            errors.append(err_msg)
-            logging.error(err_msg)
-            # Ensure errors are included even on initial parse failure
-            cpu_info['errors'] = errors
-            return cpu_info
+    @staticmethod
+    def get_temperature() -> Dict[str, Any]:
+        """
+        Gets CPU temperatures from available sensors.
 
-        # --- Process each processor block to count unique physical cores and sockets ---
-        # Stores unique physical IDs (e.g., '0', '1')
-        unique_sockets: set[str] = set()
-        # Stores unique (physical_id, core_id) tuples
-        unique_physical_cores: set[Tuple[str, str]] = set()
+        Returns:
+            A dictionary where keys are sensor labels and values are a list of
+            current, high, and critical temperatures in Celsius.
+            Returns a dictionary with an error note if not supported.
+        """
+        if not hasattr(psutil, "sensors_temperatures"):
+            return {"error": "Temperature sensing not supported on this platform by psutil."}
 
-        # We'll get representative info from the first block (assuming homogeneity)
-        first_processor_block_info: Optional[Dict[str, str]] = None
-        # Value from 'cpu cores'
-        physical_cores_per_socket: Optional[int] = None
+        temps = psutil.sensors_temperatures()
+        if not temps:
+            return {"error": "No temperature sensors found."}
 
-        for i, block_content in enumerate(processor_blocks):
-            block_info = _parse_cpuinfo_block(block_content)
+        # The key for CPU temps varies, e.g., 'coretemp' on Intel, 'k10temp' on AMD.
+        # We can look for common ones or return all available. Let's find the CPU-related ones.
+        cpu_temps = {}
+        # Common keys for CPU temperature sensors in Linux
+        cpu_sensor_keys = ['coretemp', 'k10temp', 'zenpower', 'cpu_thermal']
 
-            if i == 0:
-                first_processor_block_info = block_info
-                # Get physical cores per socket from the first block's info
-                cores_per_socket_str = block_info.get('cpu cores')
-                if cores_per_socket_str is not None:
-                    try:
-                        physical_cores_per_socket = int(cores_per_socket_str)
-                    except ValueError:
-                        logging.warning(
-                            f"Could not parse 'cpu cores' as int: '{cores_per_socket_str}'")
-                        physical_cores_per_socket = None  # Indicate parsing failed
+        for name, measurements in temps.items():
+            if any(key in name.lower() for key in cpu_sensor_keys):
+                # shwtemp(label='', current=23.0, high=82.0, critical=82.0)
+                cpu_temps[name] = [
+                    {
+                        "label": m.label or f"Core {i}",
+                        "current_celsius": m.current,
+                        "high_celsius": m.high,
+                        "critical_celsius": m.critical
+                    } for i, m in enumerate(measurements)
+                ]
 
-            # Collect physical ID and core ID to count unique entities
-            physical_id = block_info.get('physical id')
-            core_id = block_info.get('core id')
+        if not cpu_temps:
+             return {"error": "Could not identify a specific CPU temperature sensor.", "all_sensors": temps}
 
-            if physical_id is not None:
-                unique_sockets.add(physical_id)
-                if core_id is not None:
-                    # Combine physical_id and core_id into a tuple for unique core identification
-                    unique_physical_cores.add((physical_id, core_id))
-                # Note: If core_id is missing but physical_id is present, we can't count unique physical cores accurately using this method.
-                # This is unusual for standard x86 CPUs.
+        return cpu_temps
 
-        # --- Populate cpu_info dictionary ---
+    @staticmethod
+    def get_load() -> Dict[str, Any]:
+        """
+        Calculates overall and per-core CPU load percentage over a short interval.
+        Also retrieves system load average (on UNIX-like systems).
 
-        # Get representative details from the first processor block
-        if first_processor_block_info:
-            cpu_info['model_name'] = first_processor_block_info.get(
-                'model name', 'Unknown')
-            cpu_info['vendor_id'] = first_processor_block_info.get(
-                'vendor_id', 'Unknown')
-            cpu_info['cpu_family'] = first_processor_block_info.get(
-                'cpu family', 'Unknown')
-            cpu_info['model'] = first_processor_block_info.get(
-                'model', 'Unknown')
-            cpu_info['stepping'] = first_processor_block_info.get(
-                'stepping', 'Unknown')
+        Returns:
+            A dictionary containing total usage, per-core usage, and load averages.
+        """
+        # The interval is crucial for an accurate reading.
+        # A non-blocking call (interval=None) compares against the last call time.
+        # A blocking call (e.g., interval=1) is simpler and often preferred for scripts.
+        overall_percent = psutil.cpu_percent(interval=1, percpu=False)
+        per_cpu_percent = psutil.cpu_percent(interval=None, percpu=True) # Non-blocking after the first
 
-            # Get current frequency (can vary per core and over time)
-            current_freq_str = first_processor_block_info.get('cpu MHz', '0.0')
-            try:
-                cpu_info['current_frequency_mhz'] = float(current_freq_str)
-            except ValueError:
-                logging.warning(
-                    f"Could not parse 'cpu MHz' as float: '{current_freq_str}'")
-                cpu_info['current_frequency_mhz'] = 0.0
-                errors.append(
-                    f"Could not parse 'cpu MHz' value: {current_freq_str}")
+        load_avg = psutil.getloadavg() if hasattr(psutil, "getloadavg") else (None, None, None)
 
-        # Count total logical processors (threads) - simple count of 'processor' entries
-        # More robustly count lines starting with "processor" followed by whitespace and ":"
-        logical_cores = 0
-        for line in content.splitlines():
-            if line.strip().startswith('processor') and ':' in line:
-                # Ensure it's the key 'processor' not a value containing it
-                key_value_split = line.split(':', 1)
-                if key_value_split[0].strip() == 'processor':
-                    logical_cores += 1
+        return {
+            "overall_percent": overall_percent,
+            "per_cpu_percent": per_cpu_percent,
+            "load_average": {
+                "1_min": load_avg[0],
+                "5_min": load_avg[1],
+                "15_min": load_avg[2]
+            }
+        }
 
-        cpu_info['logical_cores'] = logical_cores if logical_cores > 0 else len(
-            processor_blocks)  # Fallback count
+def main():
+    """Main function to demonstrate the CPU class."""
+    print("Initializing CPU monitor...")
+    cpu = CPU()
 
-        # Count unique sockets (physical packages)
-        # If unique_sockets set is empty (e.g., physical id missing), assume 1 socket.
-        cpu_info['sockets'] = len(unique_sockets) if unique_sockets else 1
+    print("\n--- 1. CPU Specifications ---")
+    specs = cpu.get_specs()
+    print(json.dumps(specs, indent=4))
 
-        # Count unique physical cores
-        # If unique_physical_cores set is not empty, use its size.
-        # Otherwise, if physical_cores_per_socket was parsed, estimate total physical cores
-        # by multiplying sockets by physical_cores_per_socket.
-        # If neither works, assume physical cores equals logical cores (simple system).
-        if unique_physical_cores:
-            cpu_info['physical_cores'] = len(unique_physical_cores)
-        elif physical_cores_per_socket is not None:
-            cpu_info['physical_cores'] = cpu_info['sockets'] * \
-                physical_cores_per_socket
-            logging.warning(
-                f"'physical id' or 'core id' missing, estimated physical cores: {cpu_info['physical_cores']}")
-        else:
-            cpu_info['physical_cores'] = cpu_info['logical_cores']
-            logging.warning(
-                "'physical id' or 'core id' or 'cpu cores' missing, assuming physical cores == logical cores.")
+    print("\n--- 2. CPU Frequency (Real-time) ---")
+    frequency = cpu.get_frequency()
+    print(json.dumps(frequency, indent=4))
 
-        # Add the parsed physical cores per socket value if available
-        if physical_cores_per_socket is not None:
-            cpu_info['physical_cores_per_socket'] = physical_cores_per_socket
-        elif 'physical_cores' in cpu_info and cpu_info['sockets'] > 0:
-            # Estimate physical cores per socket if not directly available but total physical/sockets are
-            try:
-                cpu_info['physical_cores_per_socket'] = cpu_info['physical_cores'] // cpu_info['sockets']
-            except ZeroDivisionError:
-                # Should not happen if sockets >= 1
-                cpu_info['physical_cores_per_socket'] = cpu_info['physical_cores']
+    print("\n--- 3. CPU Temperature ---")
+    # Note: Requires root/admin privileges on some systems.
+    # May return an error if not supported or no sensors are found.
+    temperature = cpu.get_temperature()
+    print(json.dumps(temperature, indent=4))
 
-        # Note about max frequency: max/boost frequency is not reliably found in /proc/cpuinfo.
-        # It might be in /sys/devices/system/cpu/cpu*/cpufreq/ or require tools like cpupower.
+    print("\n--- 4. CPU Load (measuring over 1 second) ---")
+    load = cpu.get_load()
+    print(json.dumps(load, indent=4))
 
-    except FileNotFoundError:
-        err_msg = f'{CPUINFO_PATH} not found. Cannot get CPU info on this system.'
-        # Keep original error key for backward compatibility
-        cpu_info['error'] = err_msg
-        errors.append(err_msg)
-        logging.error(err_msg)
-    except Exception as e:
-        err_msg = f'An unexpected error occurred while reading or parsing {CPUINFO_PATH}: {e}'
-        cpu_info['error'] = err_msg  # Keep original error key
-        errors.append(err_msg)
-        logging.error(err_msg)
-
-    if errors:
-        cpu_info['errors'] = errors
-    # Ensure essential keys exist even if parsing failed for some, with default 'Unknown'/0
-    cpu_info.setdefault('model_name', 'Unknown')
-    cpu_info.setdefault('vendor_id', 'Unknown')
-    cpu_info.setdefault('cpu_family', 'Unknown')
-    cpu_info.setdefault('model', 'Unknown')
-    cpu_info.setdefault('stepping', 'Unknown')
-    cpu_info.setdefault('logical_cores', 0)
-    cpu_info.setdefault('physical_cores', 0)
-    cpu_info.setdefault('sockets', 0)
-    cpu_info.setdefault('physical_cores_per_socket', 0)
-    cpu_info.setdefault('current_frequency_mhz', 0.0)
-
-    return cpu_info
-
-
-# --- Placeholder for getting CPU runtime state ---
-def get_cpu_state() -> Dict[str, Any]:
-    """
-    Placeholder function to get CPU runtime state (usage percentage, load average).
-    This requires reading /proc/stat or using other system monitoring tools/libraries.
-    This is distinct from getting CPU configuration information from /proc/cpuinfo.
-
-    Returns:
-         A dictionary containing CPU state information (currently empty).
-    """
-    # Implementation would involve:
-    # - Reading /proc/stat to calculate per-CPU and total usage.
-    # - Reading /proc/loadavg to get system load averages.
-    # - Using psutil library (not standard library) for cross-platform compatibility.
-    logging.info(
-        "get_cpu_state called. This function is a placeholder and not implemented.")
-    state_info: Dict[str, Any] = {
-        "note": "CPU state (usage, load) retrieval is not implemented in this function."
-        # Example keys if implemented:
-        # "cpu_percent_total": 15.5,
-        # "cpu_percent_per_core": [10.2, 18.0, ...],
-        # "load_average_1min": 0.5,
-        # "load_average_5min": 0.6,
-        # "load_average_15min": 0.7
-    }
-    # Add implementation here to read /proc/stat and /proc/loadavg or use psutil
-    return state_info
-
-
-# Example of how to use the function (for testing purposes)
 if __name__ == "__main__":
-    print("Gathering CPU information...")
-    cpu_info_result = get_cpu_info()
-
-    import json
-    print("\n--- CPU Information (JSON Output) ---")
-    print(json.dumps(cpu_info_result, indent=4))
-
-    # Example of processing the results
-    print("\n--- Summary ---")
-    print(f"Model Name: {cpu_info_result.get('model_name', 'N/A')}")
-    print(f"Vendor ID: {cpu_info_result.get('vendor_id', 'N/A')}")
-    print(f"CPU Family: {cpu_info_result.get('cpu_family', 'N/A')}")
-    print(f"Model: {cpu_info_result.get('model', 'N/A')}")
-    print(f"Stepping: {cpu_info_result.get('stepping', 'N/A')}")
-    print(
-        f"Logical Cores (Threads): {cpu_info_result.get('logical_cores', 'N/A')}")
-    print(f"Physical Cores: {cpu_info_result.get('physical_cores', 'N/A')}")
-    print(f"Sockets: {cpu_info_result.get('sockets', 'N/A')}")
-    print(
-        f"Physical Cores per Socket: {cpu_info_result.get('physical_cores_per_socket', 'N/A')}")
-    freq = cpu_info_result.get('current_frequency_mhz')
-    if freq is not None and freq > 0:
-        print(f"Current Frequency: {freq:.2f} MHz")
-    else:
-        print(f"Current Frequency: N/A or 0.0 MHz")
-
-    if cpu_info_result.get('errors'):
-        print("\n--- Errors ---")
-        for error in cpu_info_result['errors']:
-            print(f"- {error}")
-
-    # Example usage of the placeholder state function
-    print("\n--- CPU State (Placeholder) ---")
-    cpu_state_result = get_cpu_state()
-    print(json.dumps(cpu_state_result, indent=4))
+    main()

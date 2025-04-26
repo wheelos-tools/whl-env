@@ -15,272 +15,187 @@
 # limitations under the License.
 
 import logging
-import platform  # Needed for platform.system()
-import re       # Needed for lspci parsing regex
-from typing import Dict, List, Any, Tuple  # Added Tuple for run_command hint
+import platform
+import json
+from typing import Dict, List, Any, Optional
 
-from whl_env.utils import run_command  # Using the user's specified import
+# Industry best practice is to use official bindings like pynvml when available.
+# It's more robust and efficient than parsing command-line output.
+try:
+    from pynvml import (
+        nvmlInit, nvmlShutdown, nvmlDeviceGetCount, nvmlDeviceGetHandleByIndex,
+        nvmlDeviceGetName, nvmlDeviceGetPciInfo, nvmlDeviceGetVbiosVersion,
+        nvmlDeviceGetDriverVersion, nvmlDeviceGetMemoryInfo, nvmlDeviceGetTemperature,
+        nvmlDeviceGetPowerUsage, nvmlDeviceGetFanSpeed, nvmlDeviceGetUtilizationRates,
+        NVMLError, NVML_TEMPERATURE_GPU
+    )
+    PYNVML_AVAILABLE = True
+except ImportError:
+    PYNVML_AVAILABLE = False
+    # Define a dummy NVMLError for the except block below
+    class NVMLError(Exception): pass
+
+# Configure basic logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 
-# Configure basic logging if not already configured
-# In a real application, you would configure logging more elaborately
-logging.basicConfig(level=logging.INFO,
-                    format='%(asctime)s - %(levelname)s - %(message)s')
-
-
-def get_gpu_info() -> Dict[str, Any]:
+class NvidiaGPU:
     """
-    Retrieves basic GPU information (model, total memory) by attempting to use
-    vendor-specific tools (like nvidia-smi) and generic tools (like lspci).
+    Represents a single NVIDIA GPU, providing access to its static specs
+    and dynamic state via the NVML library.
+    """
+    def __init__(self, handle):
+        if not PYNVML_AVAILABLE:
+            raise ImportError("pynvml library is required for NvidiaGPU class.")
+        self._handle = handle
 
-    Returns:
-        A dictionary containing:
-        - 'gpu_list': A list of dictionaries, each representing a detected GPU
-                      with details like vendor, model, bus_id, and possibly
-                      vbios_version, driver_version, total_memory_mib.
-                      Information source ('source': 'nvidia-smi' or 'lspci')
-                      is included.
-        - 'errors': A list of strings for any errors encountered during command execution or parsing.
-        - 'info': An informational message if no GPUs are detected.
-        Example Structure:
-        {
-            'gpu_list': [
-                {
-                    'vendor': 'NVIDIA',
-                    'model': 'GeForce RTX 2080',
-                    'bus_id': '0000:01:00.0', # PCI bus ID format
-                    'vbios_version': '90.04.45.00.01',
-                    'driver_version': '535.104',
-                    'total_memory_mib': 8192,
-                    'source': 'nvidia-smi'
-                },
-                {
-                    'vendor': 'Intel',
-                    'model': 'HD Graphics 620',
-                    'bus_id': '0000:00:02.0',
-                    'source': 'lspci',
-                    'details': 'Intel Corporation HD Graphics 620 [8086:5916] (rev 02)'
-                }
-            ],
-            'errors': ["Error parsing lspci output line '...'"],
-            'info': '...'
+    def get_specs(self) -> Dict[str, Any]:
+        """Returns the static specifications of the GPU."""
+        pci_info = nvmlDeviceGetPciInfo(self._handle)
+        mem_info = nvmlDeviceGetMemoryInfo(self._handle)
+
+        return {
+            "vendor": "NVIDIA",
+            "model": nvmlDeviceGetName(self._handle),
+            "bus_id": pci_info.busId,
+            "vbios_version": nvmlDeviceGetVbiosVersion(self._handle),
+            "driver_version": nvmlDeviceGetDriverVersion(),
+            "total_memory_mib": mem_info.total // (1024**2),
+            "source": "pynvml"
         }
+
+    def get_state(self) -> Dict[str, Any]:
+        """Returns the current dynamic state of the GPU."""
+        try:
+            mem_info = nvmlDeviceGetMemoryInfo(self._handle)
+            utilization = nvmlDeviceGetUtilizationRates(self._handle)
+
+            return {
+                "temperature_celsius": nvmlDeviceGetTemperature(self._handle, NVML_TEMPERATURE_GPU),
+                "power_usage_watts": nvmlDeviceGetPowerUsage(self._handle) / 1000.0, # From milliwatts
+                "fan_speed_percent": nvmlDeviceGetFanSpeed(self._handle),
+                "utilization_percent": {
+                    "gpu_core": utilization.gpu,
+                    "memory_io": utilization.memory
+                },
+                "memory_usage": {
+                    "used_mib": mem_info.used // (1024**2),
+                    "free_mib": mem_info.free // (1024**2)
+                }
+            }
+        except NVMLError as e:
+            # Some metrics might not be supported on all cards (e.g., laptops)
+            logging.warning(f"Could not retrieve full state for GPU. Error: {e}")
+            return {"error": str(e)}
+
+class GPUManager:
     """
-    gpu_list: List[Dict[str, Any]] = []
-    errors: List[str] = []
-    detected_bus_ids: set[str] = set()  # To avoid duplicates by bus ID
+    Manages detection and data retrieval for all GPUs in the system.
+    Currently focuses on NVIDIA, but is extensible for other vendors.
+    """
+    def __init__(self):
+        self.gpus: List[NvidiaGPU] = []
+        self.errors: List[str] = []
+        self._discover_gpus()
 
-    # --- 1. Attempt NVIDIA GPU info via nvidia-smi ---
-    # This is the most reliable tool for detailed NVIDIA information (model, memory, driver).
-    logging.info("Attempting to get NVIDIA GPU info via nvidia-smi...")
-    nvidia_smi_cmd = [
-        'nvidia-smi',
-        '--query-gpu=name,gpu_bus_id,vbios_version,driver_version,memory.total',
-        '--format=csv,noheader'
-    ]
-    output = run_command(nvidia_smi_cmd, timeout=10)
-
-    if output:
-        # nvidia-smi outputs CSV: name, bus_id, vbios, driver, total_memory [MiB]
-        logging.info("nvidia-smi command successful. Parsing output...")
-        for line in output.strip().split('\n'):
-            if not line.strip():  # Skip empty lines
-                continue
+    def _discover_gpus(self):
+        """Discovers GPUs using the best available method."""
+        # --- 1. Attempt NVIDIA GPU discovery via pynvml ---
+        if PYNVML_AVAILABLE:
             try:
-                # Split CSV line, handle potential extra spaces
-                parts = [p.strip() for p in line.split(',')]
-                # Expecting exactly 5 parts based on the query format
-                if len(parts) == 5:
-                    # Parse memory value, removing '[MiB]' unit string
-                    memory_str = parts[4].split(' ')[0].strip()
-                    try:
-                        total_memory_mib = int(memory_str)
-                    except ValueError:
-                        # Handle cases where memory value is not a valid integer
-                        logging.warning(
-                            f"Could not parse GPU memory value as integer: '{memory_str}' from line '{line}'")
-                        total_memory_mib = None  # Indicate parsing failed for memory
-
-                    gpu_info: Dict[str, Any] = {
-                        'vendor': 'NVIDIA',
-                        'model': parts[0],
-                        # Remove 'PCI:' prefix if present
-                        'bus_id': parts[1].replace('PCI:', ''),
-                        'vbios_version': parts[2],
-                        'driver_version': parts[3],
-                        'total_memory_mib': total_memory_mib,
-                        'source': 'nvidia-smi'
-                    }
-                    gpu_list.append(gpu_info)
-                    # Add bus ID to set
-                    detected_bus_ids.add(gpu_info['bus_id'])
-                    logging.debug(f"Parsed NVIDIA GPU: {gpu_info['model']}")
+                logging.info("Initializing NVML to discover NVIDIA GPUs...")
+                nvmlInit()
+                device_count = nvmlDeviceGetCount()
+                if device_count > 0:
+                    logging.info(f"Found {device_count} NVIDIA GPU(s).")
+                    for i in range(device_count):
+                        handle = nvmlDeviceGetHandleByIndex(i)
+                        self.gpus.append(NvidiaGPU(handle))
                 else:
-                    # Log lines that don't match the expected CSV format
-                    errors.append(
-                        f"nvidia-smi output format unexpected for line (expected 5 parts, got {len(parts)}): {line}")
-                    logging.warning(errors[-1])
+                    logging.info("NVML initialized, but no NVIDIA GPUs were found.")
+            except NVMLError as e:
+                msg = f"NVML Error during discovery: {e}. Is an NVIDIA driver installed?"
+                logging.error(msg)
+                self.errors.append(msg)
+        else:
+            msg = "pynvml library not found. NVIDIA GPU monitoring is disabled."
+            logging.warning(msg)
+            # Here you could fallback to the original `lspci` and `nvidia-smi` command-line parsing
+            # for basic detection if pynvml is not installed. For this example, we keep it clean.
+            self.errors.append(msg)
 
-            except Exception as e:  # Catch any other unexpected parsing errors per line
-                errors.append(
-                    f"Error parsing nvidia-smi output line '{line}': {e}")
-                logging.error(errors[-1])
-    else:
-        # success is True but output is empty - unlikely for nvidia-smi if GPUs are present
-        logging.info("nvidia-smi returned no output.")
+        # --- 2. Future: Add discovery for AMD, Intel GPUs ---
+        # e.g., using rocm-smi for AMD or other tools for Intel Arc.
 
-    # --- 2. Attempt to list graphics cards via lspci ---
-    # This is a more generic tool available on most Linux systems.
-    # It helps identify graphics devices regardless of vendor/driver status,
-    # but provides less detail (no memory, driver, etc.).
-    logging.info("Attempting to list graphics cards via lspci...")
-    if platform.system().lower() == 'linux':
-        # Filter for standard graphics device classes:
-        # 0300: Display controller (VGA compatible controller, etc.)
-        # 0302: 3D controller
-        lspci_cmd = ['lspci', '-nn', '-d', '::0300::,::0302::']
-        output_lspci = run_command(lspci_cmd, timeout=5)
+    def get_all_gpu_info(self) -> Dict[str, Any]:
+        """
+        Retrieves a combined report of specs and current state for all detected GPUs.
+        """
+        if not self.gpus and not self.errors:
+             return {"info": "No supported GPUs detected."}
 
-        if output_lspci:
-            logging.info("lspci command successful. Parsing output...")
-            # Output format is typically like:
-            # "01:00.0 VGA compatible controller [0300]: NVIDIA Corporation TU104 [GeForce RTX 2080] [10de:1e87] (rev a1)"
-            for line in output_lspci.strip().split('\n'):
-                if not line.strip():  # Skip empty lines
-                    continue
-                try:
-                    # Basic parsing to get device ID (bus_id) and description
-                    # Split by the first colon, the second part contains device/vendor info
-                    parts = line.split(':', 2)  # Split into at most 3 parts
-                    if len(parts) > 2:
-                        # Bus ID is the first part (e.g., "01:00.0")
-                        bus_id_full = parts[0].strip()
-                        # Normalize bus ID format (remove potential domain if present like '0000:')
-                        bus_id = bus_id_full.split(' ')[0].replace('0000:', '')
+        gpu_reports = []
+        for gpu in self.gpus:
+            report = {
+                "specs": gpu.get_specs(),
+                "state": gpu.get_state()
+            }
+            gpu_reports.append(report)
 
-                        # The rest of the line is the description
-                        description = parts[2].strip()
+        result = {"gpu_list": gpu_reports}
+        if self.errors:
+            result["errors"] = self.errors
 
-                        # Check if this GPU is already in our list (e.g., from nvidia-smi)
-                        # We match based on the normalized bus ID
-                        if bus_id not in detected_bus_ids:
-                            logging.debug(
-                                f"Parsing lspci line for potential new GPU: {line}")
-                            # Try to extract vendor and model from description using common patterns
-                            # Pattern for Vendor (usually before first '[' after controller type)
-                            # Example: "VGA compatible controller [0300]: NVIDIA Corporation [10de:1e87]"
-                            # We want "NVIDIA Corporation"
-                            vendor_match = re.search(
-                                r':\s*([^[]+?)\s*\[', description)
+        return result
 
-                            # Pattern for Model (usually inside the first '[' and ']')
-                            # Example: "NVIDIA Corporation TU104 [GeForce RTX 2080] [10de:1e87]"
-                            # We want "GeForce RTX 2080"
-                            model_match = re.search(
-                                r'\[([^]]+)\]', description)  # Finds text inside first [...]
-
-                            # Use extracted vendor/model or default to Unknown/full description
-                            vendor = vendor_match.group(
-                                1).strip() if vendor_match else 'Unknown'
-                            # Use extracted model or default to the full description if model pattern fails
-                            model = model_match.group(
-                                1).strip() if model_match else description
-
-                            # Add to list with lspci source
-                            lspci_gpu_info: Dict[str, Any] = {
-                                'vendor': vendor,
-                                'model': model,
-                                'bus_id': bus_id,
-                                'source': 'lspci',  # Indicate source of info
-                                'details': description  # Keep full description for context
-                                # Memory/Driver info typically not available from lspci alone
-                            }
-                            gpu_list.append(lspci_gpu_info)
-                            detected_bus_ids.add(bus_id)  # Add bus ID to set
-                            logging.debug(f"Added lspci GPU: {model}")
-                        else:
-                            logging.debug(
-                                f"Skipping lspci line for duplicate bus ID ({bus_id}): {line}")
-
-                    else:
-                        # Log lines that don't match expected lspci format
-                        errors.append(
-                            f"lspci output format unexpected for line: {line}")
-                        logging.warning(errors[-1])
-
-                except Exception as e:  # Catch any other unexpected parsing errors per line
-                    errors.append(
-                        f"Error parsing lspci output line '{line}': {e}")
-                    logging.error(errors[-1])
-        # else: success_lspci is True but output_lspci is empty
-        # This is not an error, it means no matching graphics devices were found by lspci.
-
-    else:
-        # Not a Linux system, lspci command is not applicable
-        logging.info(
-            f"lspci command is Linux-specific. Current system is {platform.system()}. Skipping lspci check.")
-        errors.append(
-            f"lspci command is Linux-specific. Cannot run on {platform.system()}.")
-
-    # --- 3. Combine results and finalize output ---
-    # Note: Other methods like parsing /sys/class/graphics or lshw exist
-    # but are more complex and often require root or have less standard formats.
-    # This implementation focuses on the common and useful nvidia-smi/lspci combo.
-
-    result: Dict[str, Any] = {'gpu_list': gpu_list}
-
-    # Add errors if any occurred
-    if errors:
-        result['errors'] = errors
-
-    # Add an informational message if no GPUs were found and there were no critical errors
-    # Critical errors (like command not found) are already in 'errors'.
-    # If errors exist but gpu_list is empty, the errors explain why.
-    if not gpu_list and 'errors' not in result:
-        result['info'] = 'No graphics devices detected via standard methods (nvidia-smi, lspci).'
-        logging.info(result['info'])
-    elif gpu_list:
-        logging.info(f"Detected {len(gpu_list)} graphics device(s).")
-
-    return result
+    def __del__(self):
+        """Ensure NVML is shut down cleanly when the manager is destroyed."""
+        if PYNVML_AVAILABLE:
+            try:
+                nvmlShutdown()
+                logging.info("NVML shut down successfully.")
+            except NVMLError as e:
+                logging.error(f"Error shutting down NVML: {e}")
 
 
-# Example of how to use the function (for testing purposes)
-if __name__ == "__main__":
-    print("Gathering GPU information...")
-    gpu_info_result = get_gpu_info()
+def main():
+    """Main function to demonstrate the GPUManager."""
+    print("Initializing GPU Manager...")
+    manager = GPUManager()
 
-    import json
-    print("\n--- GPU Information (JSON Output) ---")
-    print(json.dumps(gpu_info_result, indent=4))
+    print("\n--- GPU Information Report (JSON Output) ---")
+    full_info = manager.get_all_gpu_info()
+    print(json.dumps(full_info, indent=4))
 
-    # Example of processing the results
-    if gpu_info_result.get('gpu_list'):
+    # Example of processing the detailed results
+    if full_info.get('gpu_list'):
         print("\n--- Summary ---")
-        for gpu in gpu_info_result['gpu_list']:
-            print(f"GPU:")
-            print(f"  Vendor: {gpu.get('vendor', 'N/A')}")
-            print(f"  Model: {gpu.get('model', 'N/A')}")
-            print(f"  Bus ID: {gpu.get('bus_id', 'N/A')}")
-            print(f"  Source: {gpu.get('source', 'N/A')}")
+        for i, gpu_report in enumerate(full_info['gpu_list']):
+            specs = gpu_report.get('specs', {})
+            state = gpu_report.get('state', {})
+            print(f"GPU #{i}: {specs.get('model', 'N/A')}")
+            print(f"  Bus ID: {specs.get('bus_id', 'N/A')}")
+            print(f"  Driver: {specs.get('driver_version', 'N/A')}")
+            print(f"  Memory: {specs.get('total_memory_mib', 'N/A')} MiB")
 
-            if gpu.get('source') == 'nvidia-smi':
-                memory_mib = gpu.get('total_memory_mib')
-                if memory_mib is not None:
-                    print(f"  Total Memory: {memory_mib} MiB")
-                else:
-                    print("  Total Memory: N/A (Parsing failed)")
-                print(f"  Driver Version: {gpu.get('driver_version', 'N/A')}")
-                print(f"  VBIOS Version: {gpu.get('vbios_version', 'N/A')}")
-            elif gpu.get('source') == 'lspci':
-                print(f"  Details: {gpu.get('details', 'N/A')}")
+            if "error" not in state:
+                print(f"  Live State:")
+                print(f"    - Temp: {state.get('temperature_celsius', 'N/A')}°C")
+                print(f"    - Power: {state.get('power_usage_watts', 'N/A')} W")
+                print(f"    - Core Usage: {state.get('utilization_percent', {}).get('gpu_core', 'N/A')}%")
+            else:
+                print(f"  Live State: Error retrieving state - {state.get('error')}")
 
-            print("-" * 10)
+            print("-" * 20)
 
-    if gpu_info_result.get('errors'):
+    if full_info.get('errors'):
         print("\n--- Errors ---")
-        for error in gpu_info_result['errors']:
+        for error in full_info['errors']:
             print(f"- {error}")
 
-    if gpu_info_result.get('info'):
-        print(f"\n--- Info ---\n{gpu_info_result['info']}")
+    if full_info.get('info'):
+        print(f"\n--- Info ---\n{full_info['info']}")
+
+
+if __name__ == "__main__":
+    main()
